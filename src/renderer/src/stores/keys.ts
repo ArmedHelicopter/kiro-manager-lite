@@ -213,6 +213,8 @@ export const useKeysStore = defineStore('keys', () => {
   async function renameGroup(id: string, name: string): Promise<string | null> {
     const label = name.trim()
     if (!label) return '分组名称不能为空'
+    // 和别的分组重名时拒绝，否则筛选里会出现两个同名分组
+    if (groups.value.some((g) => g.id !== id && g.name === label)) return `分组「${label}」已存在`
     return commitGroups(groups.value.map((g) => (g.id === id ? { ...g, name: label } : g)))
   }
 

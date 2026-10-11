@@ -1,9 +1,11 @@
 <script setup lang="ts">
 /**
- * 分组网格：一排两个，长按可拖动排序，右侧三点菜单可改名 / 删除。
+ * 分组网格：默认一排两个（columns 可调）。
  *
- * 筛选面板与「批量设置分组」弹窗共用这一个组件，两者只有选中语义不同：
- * 面板里是多选筛选，弹窗里是单选目标分组，靠 multiple 区分。
+ * 筛选面板、「批量设置分组」与「管理分组」三处共用：
+ *  - editable：只有管理分组打开，此时可长按拖动排序、右键或右侧三点改名 / 删除；
+ *    其余两处只做选择，不显示拖动手柄与三点，也不响应长按和右键。
+ *  - multiple：选中语义，筛选与管理是多选，批量设置是单选。
  */
 import { onBeforeUnmount, nextTick, ref } from 'vue'
 import { EditOutlined, DeleteOutlined, HolderOutlined, MoreOutlined } from '@ant-design/icons-vue'
@@ -16,17 +18,39 @@ const props = defineProps<{
   /** 各分组的账号数，可选；给了就在名字后面显示计数 */
   counts?: Record<string, number>
   multiple?: boolean
+  /** 每排几个，默认 2 */
+  columns?: number
+  /**
+   * 固定显示几排：列表高度固定为这么多排，分组少时也不缩，超出在内部上下滚动。
+   * 不传时最多约五排高、随内容收缩。
+   */
+  rows?: number
+  /** 可拖动排序、改名、删除 */
+  editable?: boolean
+  /** 删除气泡确认里的说明，按分组生成（如其下有多少条目） */
+  removeText?: (group: AccountGroup) => string
 }>()
 
 const emit = defineEmits<{
   select: [id: string]
   rename: [group: AccountGroup]
+  /** 已在气泡里确认过的删除 */
   remove: [group: AccountGroup]
   reorder: [orderedIds: string[]]
 }>()
 
 /** 哪个分组的菜单是打开的：右键与三点两条入口共用 */
 const menuOpenId = ref('')
+/**
+ * 哪个分组的删除气泡是打开的。菜单点「删除分组」后菜单收起，再由这里弹出气泡，
+ * 气泡挂在该分组的三点上：右键和三点两条入口都从同一位置弹出确认。
+ */
+const confirmId = ref('')
+
+function askRemove(group: AccountGroup): void {
+  menuOpenId.value = ''
+  confirmId.value = group.id
+}
 
 // ---- 长按拖拽排序 ----
 /**
@@ -39,6 +63,8 @@ const menuOpenId = ref('')
  * 与横向标签栏的区别只有一处：网格是二维的，让位位移要算 x 和 y 两个方向。
  */
 const LONG_PRESS_MS = 220
+/** 删除气泡要压过所在弹窗（管理分组抬到了 1050） */
+const POPUP_Z_INDEX = 1100
 /** 松手后归位动画的时长，和同伴让位的过渡保持一致 */
 const SETTLE_MS = 180
 
@@ -268,8 +294,8 @@ function onPressMove(e: MouseEvent): void {
 }
 
 function startPress(id: string, e: MouseEvent): void {
-  // 只响应左键，右键要留给上下文菜单
-  if (e.button !== 0) return
+  // 只读模式不拖动；只响应左键，右键要留给上下文菜单
+  if (!props.editable || e.button !== 0) return
   endDrag()
   dragSession = false
   pressPoint = { x: e.clientX, y: e.clientY }
@@ -314,7 +340,15 @@ onBeforeUnmount(endDrag)
 </script>
 
 <template>
-  <div ref="gridRef" class="group-grid" :class="{ 'no-anim': noAnim }">
+  <div
+    ref="gridRef"
+    class="group-grid"
+    :class="{ 'no-anim': noAnim, fixed: !!props.rows }"
+    :style="{
+      gridTemplateColumns: `repeat(${props.columns ?? 2}, minmax(0, 1fr))`,
+      ...(props.rows ? { '--rows': props.rows } : {})
+    }"
+  >
     <!--
       整格支持右键唤出菜单，三点图标点击复用同一个浮层（把 menuOpenId 置为该分组），
       这样右键与三点两条入口共用一份菜单定义，不会出现两处菜单项走样。
@@ -323,9 +357,9 @@ onBeforeUnmount(endDrag)
     <a-dropdown
       v-for="group in props.groups"
       :key="group.id"
-      :trigger="['contextmenu']"
+      :trigger="props.editable ? ['contextmenu'] : []"
       placement="bottomRight"
-      :open="menuOpenId === group.id"
+      :open="props.editable && menuOpenId === group.id"
       @open-change="(v: boolean) => (menuOpenId = v ? group.id : '')"
     >
       <div
@@ -340,19 +374,36 @@ onBeforeUnmount(endDrag)
         @mousedown="startPress(group.id, $event)"
         @click="onCellClick(group.id)"
       >
-        <HolderOutlined class="grip" />
+        <HolderOutlined v-if="props.editable" class="grip" />
         <span class="group-name" :title="group.name">{{ group.name }}</span>
         <span v-if="props.counts" class="group-count muted">{{ props.counts[group.id] ?? 0 }}</span>
 
         <!-- 阻止冒泡：点三点不应该连带切换选中，也不该触发长按计时 -->
-        <span
-          class="group-more"
-          title="更多"
-          @click.stop="menuOpenId = menuOpenId === group.id ? '' : group.id"
-          @mousedown.stop
+        <!-- 气泡只受 confirmId 控制，不响应点击：三点本身的点击是开菜单 -->
+        <a-popconfirm
+          v-if="props.editable"
+          :open="confirmId === group.id"
+          :trigger="[]"
+          placement="bottomRight"
+          title="删除分组"
+          :description="props.removeText?.(group) ?? `确认删除分组「${group.name}」？`"
+          ok-text="确认删除"
+          cancel-text="取消"
+          :ok-button-props="{ danger: true }"
+          :overlay-style="{ zIndex: POPUP_Z_INDEX, maxWidth: '320px' }"
+          @confirm="(confirmId = ''), emit('remove', group)"
+          @cancel="confirmId = ''"
+          @open-change="(v: boolean) => !v && (confirmId = '')"
         >
-          <MoreOutlined />
-        </span>
+          <span
+            class="group-more"
+            title="更多"
+            @click.stop="menuOpenId = menuOpenId === group.id ? '' : group.id"
+            @mousedown.stop
+          >
+            <MoreOutlined />
+          </span>
+        </a-popconfirm>
       </div>
 
       <template #overlay>
@@ -361,7 +412,7 @@ onBeforeUnmount(endDrag)
             <EditOutlined />
             编辑分组名称
           </a-menu-item>
-          <a-menu-item key="remove" danger @click="emit('remove', group)">
+          <a-menu-item key="remove" danger @click="askRemove(group)">
             <DeleteOutlined />
             删除分组
           </a-menu-item>
@@ -373,7 +424,7 @@ onBeforeUnmount(endDrag)
 
 <style scoped>
 /*
- * 一排两个，最多约五行高，超出自己滚动 ——
+ * 最多约五行高，超出自己滚动 ——
  * 几十上百个分组时不能把面板 / 弹窗一路撑到屏幕外。
  *
  * position: relative 让它成为格子的 offsetParent：拖拽的几何快照用的是
@@ -382,7 +433,6 @@ onBeforeUnmount(endDrag)
 .group-grid {
   position: relative;
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
   max-height: 232px;
   overflow-y: auto;
@@ -405,6 +455,19 @@ onBeforeUnmount(endDrag)
 
 .group-grid::-webkit-scrollbar-thumb:hover {
   background: rgba(140, 140, 160, 0.6);
+}
+
+/*
+ * 固定排数：行高取格子的实际高度（上下内边距 7 + 内容 20 + 边框 2 = 36），
+ * 总高 = 排数 × 行高 + 间距。align-content: start 让行贴顶，不被拉伸撑满；
+ * 超出这个高度由 overflow-y: auto 在内部滚动，弹窗不会跟着无限增高。
+ */
+.group-grid.fixed {
+  --row: 36px;
+  grid-auto-rows: var(--row);
+  align-content: start;
+  height: calc(var(--row) * var(--rows) + 8px * (var(--rows) - 1));
+  max-height: none;
 }
 
 /*
@@ -434,9 +497,11 @@ onBeforeUnmount(endDrag)
   border-color: var(--kal-primary);
 }
 
+/* 选中态：主题色描边 + 带透明度的主题色底，文字跟着变主色（与常用工具里状态码选中一致） */
 .group-cell.on {
   border-color: var(--kal-primary);
-  background: var(--kal-block-bg);
+  background: color-mix(in srgb, var(--kal-primary) 12%, transparent);
+  color: var(--kal-primary);
 }
 
 /* 被拖起来的那个：虚线 + 底色，浮在同伴之上跟着光标走 */

@@ -23,7 +23,6 @@ import {
   SettingOutlined,
   CalendarOutlined,
   FilterOutlined,
-  SortAscendingOutlined,
   SwapOutlined,
   SyncOutlined,
   ThunderboltOutlined,
@@ -48,6 +47,8 @@ import {
 import { normalizeSubscriptionType } from '@shared/subscription'
 import { keyIssueOf, shouldSkipKeyUsageRefresh } from '@shared/refreshPolicy'
 import RegionSelect from '@/components/common/RegionSelect.vue'
+import AddApiKeyModal from '@/components/keys/AddApiKeyModal.vue'
+import ImportApiKeysModal from '@/components/keys/ImportApiKeysModal.vue'
 import VirtualGrid from '@/components/common/VirtualGrid.vue'
 import UsageHistoryModal from '@/components/accounts/UsageHistoryModal.vue'
 import GatewayHistoryModal from '@/components/keys/GatewayHistoryModal.vue'
@@ -58,6 +59,10 @@ import ApiKeyBatchTestModal from '@/components/keys/ApiKeyBatchTestModal.vue'
 import ApiKeyFilterPanel from '@/components/keys/ApiKeyFilterPanel.vue'
 import ExportApiKeysModal from '@/components/keys/ExportApiKeysModal.vue'
 import GroupPanel from '@/components/common/GroupPanel.vue'
+import GroupManageModal from '@/components/common/GroupManageModal.vue'
+import SortMenu from '@/components/common/SortMenu.vue'
+import { useRangeSelect } from '@/utils/rangeSelect'
+import { DEFAULT_SORT, SORT_FIELDS, compareBy, type SortField, type SortKey } from '@/utils/listSort'
 import GroupPickerModal from '@/components/common/GroupPickerModal.vue'
 import BatchNoteModal from '@/components/common/BatchNoteModal.vue'
 import DisplayModeSelect from '@/components/common/DisplayModeSelect.vue'
@@ -97,12 +102,7 @@ async function detectCapability(): Promise<void> {
 }
 
 const addOpen = ref(false)
-const addValue = ref('')
-const addNote = ref('')
-const adding = ref(false)
 const importOpen = ref(false)
-const importText = ref('')
-const importing = ref(false)
 
 const editOpen = ref(false)
 const editId = ref('')
@@ -115,7 +115,7 @@ const usageTarget = ref<KeyEntry | null>(null)
 const gatewayHistoryTarget = ref<KeyEntry | null>(null)
 const gatewayHistoryMetric = ref<'requests' | 'credits'>('requests')
 const selectedIds = ref<string[]>([])
-const sortKey = ref<'createdAt' | 'usage' | 'checked' | 'note'>('createdAt')
+const sortKey = ref<SortKey>(DEFAULT_SORT)
 
 const filterOpen = ref(false)
 /** 筛选条件常驻本页：面板收起后条件仍然生效 */
@@ -150,18 +150,14 @@ function resetFilter(): void {
 
 // ============ 分组 ============
 const groupOpen = ref(false)
-/**
- * 分组面板里正开着改名弹窗或删除确认。
- * 这些弹窗 teleport 到 body，点它们会被 popover 当成「点了外面」而自动收起，
- * 面板连同弹窗一起被卸载。busy 期间按住 popover 不让它关。
- */
-const groupBusy = ref(false)
+const groupManageOpen = ref(false)
 const batchGroupOpen = ref(false)
 const batchNoteOpen = ref(false)
 
-function onGroupOpenChange(open: boolean): void {
-  if (!open && groupBusy.value) return
-  groupOpen.value = open
+/** 打开分组管理弹窗：先收起筛选浮层，免得两层叠在一起 */
+function openGroupManage(): void {
+  groupOpen.value = false
+  groupManageOpen.value = true
 }
 
 function toggleGroupFilter(id: string): void {
@@ -272,9 +268,6 @@ const configOpen = ref(false)
 const configKrs = ref(19830)
 const configCps = ref(19831)
 const savingConfig = ref(false)
-/** 添加 / 导入时为本批 Key 选择的区域 */
-const addRegion = ref(DEFAULT_REGION)
-const importRegion = ref(DEFAULT_REGION)
 /** 正在换区的 Key */
 const regionTarget = ref<KeyEntry | null>(null)
 const regionValue = ref(DEFAULT_REGION)
@@ -332,13 +325,8 @@ const restartPromptMessage = computed(() => {
     : `${enabledText} 如当前 IDE 会话未重新连接，可重启后继续使用。`
 })
 
-const sortOptions = [
-  { value: 'createdAt', label: '添加时间' },
-  { value: 'usage', label: '用量占比' },
-  { value: 'checked', label: '最后同步' },
-  { value: 'note', label: '备注' }
-] as const
-const sortLabel = computed(() => sortOptions.find((item) => item.value === sortKey.value)?.label)
+/** API Key 没有会过期的 Token，排序项里不列 Token 有效期 */
+const sortFields = SORT_FIELDS.filter((item) => item.field !== 'token')
 
 const filteredKeys = computed(() => {
   const needle = search.value.trim().toLowerCase()
@@ -356,7 +344,6 @@ const filteredKeys = computed(() => {
   const groupSet = groupIds.length ? new Set(groupIds) : null
   // 排序比较器每次比较都会读，先取出来，免得反复经过响应式 getter
   const activeId = data.value.activeKeyId
-  const sort = sortKey.value
   // 用量比例算一次记下来：比较器里每次比较要算两遍，n log n 次就是一笔不小的开销
   const ratios = new Map<string, number>()
   const ratioOf = (entry: KeyEntry): number => {
@@ -364,6 +351,20 @@ const filteredKeys = computed(() => {
     if (value === undefined) ratios.set(entry.id, (value = usageRatio(entry)))
     return value
   }
+  const compare = compareBy(
+    sortKey.value,
+    (entry: KeyEntry, field: SortField) => {
+      if (field === 'email') return entry.email
+      // 没查到过额度的 Key 三项积分都算缺值，排到最后
+      const total = entry.totalCredits
+      if (field === 'usage') return total ? ratioOf(entry) : undefined
+      if (field === 'usedCredits') return total ? entry.usedCredits || 0 : undefined
+      if (field === 'remainingCredits') return total ? total - (entry.usedCredits || 0) : undefined
+      if (field === 'reset') return keyDaysRemaining(entry) ?? undefined
+      return field === 'createdAt' ? entry.createdAt : undefined
+    },
+    (entry: KeyEntry) => entry.createdAt
+  )
   // filter 本身就返回新数组，sort 不会动到 store 里的原数组
   return data.value.keys
     .filter((entry) => {
@@ -400,10 +401,7 @@ const filteredKeys = computed(() => {
     .sort((a, b) => {
       const active = Number(b.id === activeId) - Number(a.id === activeId)
       if (active) return active
-      if (sort === 'usage') return ratioOf(b) - ratioOf(a)
-      if (sort === 'checked') return (b.lastCheckedAt || 0) - (a.lastCheckedAt || 0)
-      if (sort === 'note') return (a.note || '').localeCompare(b.note || '')
-      return b.createdAt - a.createdAt
+      return compare(a, b)
     })
 })
 
@@ -443,11 +441,16 @@ const someVisibleSelected = computed(() => visibleSelectedCount.value > 0 && !al
 const normalCount = computed(() => keyStats.value.byStatus.normal)
 const errorCount = computed(() => keyStats.value.byStatus.error)
 
-function toggleSelect(id: string, checked: boolean): void {
-  const next = new Set(selectedIds.value)
-  checked ? next.add(id) : next.delete(id)
-  selectedIds.value = [...next]
-}
+/** 单击勾选；按住 Shift 勾选一段，Ctrl / Cmd + A 勾选当前筛选结果（见 rangeSelect） */
+const { toggle: toggleSelect } = useRangeSelect({
+  order: () => filteredKeys.value.map((entry) => entry.id),
+  apply: (ids, checked) => {
+    const next = new Set(selectedIds.value)
+    for (const id of ids) checked ? next.add(id) : next.delete(id)
+    selectedIds.value = [...next]
+  },
+  selectAll: () => toggleSelectVisible(true)
+})
 
 function toggleSelectVisible(checked: boolean): void {
   const next = new Set(selectedIds.value)
@@ -620,56 +623,6 @@ function setBusy(id: string, action: BusyAction, busy: boolean): void {
   const key = `${id}:${action}`
   busy ? next.add(key) : next.delete(key)
   busyActions.value = next
-}
-
-/** 打开时预填上次用过的区域，连续添加同区域的 Key 不用反复选 */
-function openAdd(): void {
-  addValue.value = ''
-  addNote.value = ''
-  addRegion.value = data.value.region || DEFAULT_REGION
-  addOpen.value = true
-}
-
-function openImport(): void {
-  importText.value = ''
-  importRegion.value = data.value.region || DEFAULT_REGION
-  importOpen.value = true
-}
-
-async function submitAdd(): Promise<void> {
-  adding.value = true
-  try {
-    const rawKey = addValue.value.trim()
-    const error = await store.add(rawKey, addNote.value, addRegion.value)
-    if (error) return void message.error(error)
-    const added = data.value.keys.find((entry) => entry.key === rawKey)
-    const verifyError = added ? await store.sync(added.id) : null
-    addOpen.value = false
-    addValue.value = ''
-    addNote.value = ''
-    if (verifyError) message.warning(`Key 已保存，但远端校验失败：${verifyError}`)
-    else message.success('API Key 已添加并校验通过')
-  } finally {
-    adding.value = false
-  }
-}
-
-async function submitImport(): Promise<void> {
-  importing.value = true
-  try {
-    const result = await store.importText(importText.value, importRegion.value)
-    if (result.error) return void message.error(result.error)
-    const synced = result.added ? await store.syncAll(false) : null
-    if (synced && !synced.error) store.scheduleUsageRefresh()
-    importOpen.value = false
-    importText.value = ''
-    const syncText = synced && !synced.error
-      ? `；校验成功 ${synced.success}，失败 ${synced.failed}`
-      : ''
-    message.success(`已添加 ${result.added} 个，重复 ${result.skipped} 个，无效 ${result.invalid} 个${syncText}`)
-  } finally {
-    importing.value = false
-  }
 }
 
 function openEdit(entry: KeyEntry): void {
@@ -1166,10 +1119,10 @@ onUnmounted(() => store.stopStatsPolling())
           <template #prefix><SearchOutlined /></template>
         </a-input>
         <span class="spacer" />
-        <a-button type="primary" @click="openAdd">
+        <a-button type="primary" @click="addOpen = true">
           <template #icon><PlusOutlined /></template>添加 API Key
         </a-button>
-        <a-button @click="openImport"><template #icon><UploadOutlined /></template>导入</a-button>
+        <a-button @click="importOpen = true"><template #icon><UploadOutlined /></template>导入</a-button>
         <a-button :disabled="!data.keys.length" @click="exportKeys">
           <template #icon><DownloadOutlined /></template>导出
         </a-button>
@@ -1217,11 +1170,8 @@ onUnmounted(() => store.stopStatsPolling())
           trigger="click"
           placement="bottomRight"
           :get-popup-container="bodyPopupContainer"
-          @open-change="onGroupOpenChange"
+          @open-change="(open: boolean) => (groupOpen = open)"
         >
-          <template #title>
-            <span>分组</span>
-          </template>
           <template #content>
             <GroupPanel
               v-if="groupOpen"
@@ -1231,7 +1181,7 @@ onUnmounted(() => store.stopStatsPolling())
               entity="Key"
               @toggle="toggleGroupFilter"
               @clear="filter.groupIds = []"
-              @busy="groupBusy = $event"
+              @manage="openGroupManage"
             />
           </template>
           <a-badge :count="filter.groupIds.length" :offset="[-4, 4]">
@@ -1242,19 +1192,7 @@ onUnmounted(() => store.stopStatsPolling())
           </a-badge>
         </a-popover>
 
-        <a-dropdown>
-          <a-button :size="toolbarSize">
-            <template #icon><SortAscendingOutlined /></template>
-            {{ sortLabel }} <DownOutlined />
-          </a-button>
-          <template #overlay>
-            <a-menu :selected-keys="[sortKey]">
-              <a-menu-item v-for="item in sortOptions" :key="item.value" @click="sortKey = item.value">
-                {{ item.label }}
-              </a-menu-item>
-            </a-menu>
-          </template>
-        </a-dropdown>
+        <SortMenu v-model="sortKey" :fields="sortFields" :size="toolbarSize" />
         <a-divider type="vertical" style="margin: 0 2px" />
         <a-button :size="toolbarSize" :loading="syncing" @click="syncAll">
           <template #icon><SyncOutlined /></template>
@@ -1491,7 +1429,11 @@ onUnmounted(() => store.stopStatsPolling())
           <div class="error-line">{{ keyIssue(entry) }}</div>
         </a-tooltip>
 
-        <div class="key-actions" @click.stop>
+        <!--
+          底部动作区的空白（切换按钮与右侧图标之间）照样落到整卡点击、切换勾选；
+          只拦按钮本身：切换按钮自带 .stop，右侧图标整排在 action-row 上拦
+        -->
+        <div class="key-actions">
           <div class="key-switch-action">
             <span v-if="entry.id === data.activeKeyId" class="current-key-label">
               <CheckCircleFilled />
@@ -1509,7 +1451,7 @@ onUnmounted(() => store.stopStatsPolling())
               切换到该 Key
             </a-button>
           </div>
-          <div class="action-row">
+          <div class="action-row" @click.stop>
             <a-tooltip title="刷新用量与积分">
               <a-button
                 type="text"
@@ -1561,50 +1503,9 @@ onUnmounted(() => store.stopStatsPolling())
       @update:open="(v) => !v && (cliTarget = null)"
     />
 
-    <a-modal
-      v-if="addOpen"
-      v-model:open="addOpen"
-      title="添加 Kiro API Key"
-      centered
-      :confirm-loading="adding"
-      @ok="submitAdd"
-    >
-      <a-form layout="vertical">
-        <a-form-item label="API Key" required>
-          <a-input-password v-model:value="addValue" placeholder="ksk_..." />
-        </a-form-item>
-        <a-form-item label="区域" required>
-          <RegionSelect v-model:value="addRegion" />
-          <div class="field-hint muted">不同 Key 可能属于不同区域，选错会导致额度查询与请求失败</div>
-        </a-form-item>
-        <a-form-item label="备注">
-          <a-input v-model:value="addNote" placeholder="例如：主力 Key" @press-enter="submitAdd" />
-        </a-form-item>
-      </a-form>
-    </a-modal>
+    <AddApiKeyModal v-if="addOpen" @close="addOpen = false" />
 
-    <a-modal
-      v-if="importOpen"
-      v-model:open="importOpen"
-      title="批量导入 API Key"
-      centered
-      :confirm-loading="importing"
-      @ok="submitImport"
-    >
-      <a-form layout="vertical">
-        <a-form-item label="区域" required>
-          <RegionSelect v-model:value="importRegion" />
-          <div class="field-hint muted">本批 Key 共用该区域，导入后可在卡片上逐个调整</div>
-        </a-form-item>
-        <a-form-item label="API Key" required>
-          <a-textarea
-            v-model:value="importText"
-            :rows="9"
-            placeholder="每行一个 ksk_ 开头的 API Key，自动忽略空行和重复项"
-          />
-        </a-form-item>
-      </a-form>
-    </a-modal>
+    <ImportApiKeysModal v-if="importOpen" @close="importOpen = false" />
 
     <a-modal
       v-if="regionTarget"
@@ -1652,6 +1553,13 @@ onUnmounted(() => store.stopStatsPolling())
       :ids="selectedIds"
       entity="Key"
       @close="batchGroupOpen = false"
+      @manage="groupManageOpen = true"
+    />
+    <GroupManageModal
+      v-if="groupManageOpen"
+      :api="groupApi"
+      entity="Key"
+      @close="groupManageOpen = false"
     />
 
     <!-- 目标取自 filteredKeys（勾选时只取勾选项）：顺序与内容都跟界面卡片保持一致 -->

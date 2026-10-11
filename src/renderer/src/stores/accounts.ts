@@ -198,12 +198,14 @@ export const useAccountsStore = defineStore('accounts', () => {
     return group
   }
 
-  function renameGroup(id: string, name: string): boolean {
+  /** 改名；返回错误文案，成功为 null。和别的分组重名时拒绝，否则筛选里会出现两个同名分组 */
+  function renameGroup(id: string, name: string): string | null {
     const label = name.trim()
-    if (!label) return false
+    if (!label) return '分组名称不能为空'
+    if (groups.value.some((g) => g.id !== id && g.name === label)) return `分组「${label}」已存在`
     groups.value = groups.value.map((g) => (g.id === id ? { ...g, name: label } : g))
     persist()
-    return true
+    return null
   }
 
   /** 删除分组：同时把引用它的账号置回未分组，不留悬空 id */

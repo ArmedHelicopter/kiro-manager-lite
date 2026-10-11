@@ -15,7 +15,6 @@ import {
   KeyOutlined,
   PlusOutlined,
   SearchOutlined,
-  SortAscendingOutlined,
   SyncOutlined,
   UploadOutlined
 } from '@ant-design/icons-vue'
@@ -30,6 +29,11 @@ import EditAccountModal from '@/components/accounts/EditAccountModal.vue'
 import BatchNoteModal from '@/components/common/BatchNoteModal.vue'
 import GroupPickerModal from '@/components/common/GroupPickerModal.vue'
 import GroupPanel from '@/components/common/GroupPanel.vue'
+import GroupManageModal from '@/components/common/GroupManageModal.vue'
+import BatchCreateApiKeyModal from '@/components/accounts/BatchCreateApiKeyModal.vue'
+import SortMenu from '@/components/common/SortMenu.vue'
+import { useRangeSelect } from '@/utils/rangeSelect'
+import { DEFAULT_SORT, SORT_FIELDS, compareBy, type SortField, type SortKey } from '@/utils/listSort'
 import DisplayModeSelect from '@/components/common/DisplayModeSelect.vue'
 import AccountDetailDrawer from '@/components/accounts/AccountDetailDrawer.vue'
 import AccountTestModal from '@/components/accounts/AccountTestModal.vue'
@@ -75,6 +79,15 @@ function openImport(kind: 'file' | 'text'): void {
 const exportOpen = ref(false)
 const batchNoteOpen = ref(false)
 const batchGroupOpen = ref(false)
+const batchApiKeyOpen = ref(false)
+
+/** 批量生成的目标：全部勾选项，按界面当前排序，被筛掉的勾选项排在后面 */
+const batchApiKeyTargets = computed(() => {
+  const selected = new Set(accountsStore.selectedIds)
+  const visible = sorted.value.filter((account) => selected.has(account.id))
+  const shown = new Set(visible.map((account) => account.id))
+  return [...visible, ...accountsStore.accounts.filter((a) => selected.has(a.id) && !shown.has(a.id))]
+})
 const editTarget = ref<Account | null>(null)
 const detailTarget = ref<Account | null>(null)
 const testTarget = ref<Account | null>(null)
@@ -87,9 +100,7 @@ const rowBusy = ref<Record<string, string | undefined>>({})
 const batchProgress = ref('')
 const BatchProgressText = (): ReturnType<typeof h> => h('span', null, batchProgress.value)
 
-type SortKey = 'createdAt' | 'email' | 'usage' | 'reset' | 'checked'
-
-const sortKey = ref<SortKey>('createdAt')
+const sortKey = ref<SortKey>(DEFAULT_SORT)
 
 const busy = computed(() => accountsStore.task.running)
 /**
@@ -117,30 +128,14 @@ const refreshButtonText = computed(() => {
 
 const stats = computed(() => accountsStore.stats)
 
-const sortOptions: { value: SortKey; label: string }[] = [
-  { value: 'createdAt', label: '添加时间' },
-  { value: 'email', label: '邮箱' },
-  { value: 'usage', label: '用量占比' },
-  { value: 'reset', label: '重置剩余天数' },
-  { value: 'checked', label: '最后检查' }
-]
-
-const sortLabel = computed(
-  () => sortOptions.find((o) => o.value === sortKey.value)?.label ?? '添加时间'
-)
-
 const filterOpen = ref(false)
 const groupOpen = ref(false)
-/**
- * 分组面板里正开着改名弹窗或删除确认。
- * 这些弹窗 teleport 到 body，点它们会被 popover 当成「点了外面」而自动收起，
- * 面板连同弹窗一起被卸载。busy 期间按住 popover 不让它关。
- */
-const groupBusy = ref(false)
+const groupManageOpen = ref(false)
 
-function onGroupOpenChange(open: boolean): void {
-  if (!open && groupBusy.value) return
-  groupOpen.value = open
+/** 打开分组管理弹窗：先收起筛选浮层，免得两层叠在一起 */
+function openGroupManage(): void {
+  groupOpen.value = false
+  groupManageOpen.value = true
 }
 
 /** 筛选面板里生效的条件数量，显示在筛选按钮的角标上 */
@@ -235,25 +230,25 @@ const gridLayout = computed(() => {
   }
 })
 
+/** 排序取值：重置取剩余天数，Token 取 access token 过期时刻 */
+function accountSortValue(account: Account, field: SortField): number | string | undefined {
+  if (field === 'email') return account.email
+  // 没拉到过额度（limit 为 0）的账号三项积分都算缺值，排到最后
+  const synced = account.usage.limit > 0
+  if (field === 'usage') return synced ? account.usage.percentUsed : undefined
+  if (field === 'usedCredits') return synced ? account.usage.current : undefined
+  if (field === 'remainingCredits') return synced ? account.usage.limit - account.usage.current : undefined
+  if (field === 'reset') return account.subscription.daysRemaining ?? undefined
+  if (field === 'token') return account.credentials.expiresAt || undefined
+  return account.createdAt || 0
+}
+
 const sorted = computed(() => {
-  const list = [...accountsStore.filtered]
-  switch (sortKey.value) {
-    case 'email':
-      return list.sort((a, b) => a.email.localeCompare(b.email))
-    case 'usage':
-      return list.sort((a, b) => (b.usage.percentUsed || 0) - (a.usage.percentUsed || 0))
-    case 'reset':
-      return list.sort(
-        (a, b) => (a.subscription.daysRemaining ?? 9999) - (b.subscription.daysRemaining ?? 9999)
-      )
-    case 'checked':
-      return list.sort((a, b) => (b.lastCheckedAt ?? 0) - (a.lastCheckedAt ?? 0))
-    default:
-      // 激活账号置顶，其余按添加时间倒序
-      return list.sort(
-        (a, b) => Number(b.isActive) - Number(a.isActive) || (b.createdAt || 0) - (a.createdAt || 0)
-      )
-  }
+  const compare = compareBy(sortKey.value, accountSortValue, (a: Account) => a.createdAt || 0)
+  // IDE 当前账号始终置顶，其余按所选排序
+  return [...accountsStore.filtered].sort(
+    (a, b) => Number(b.isActive) - Number(a.isActive) || compare(a, b)
+  )
 })
 
 /** 网格数据：账号卡片 + 末尾一张「添加账号」卡 */
@@ -316,9 +311,15 @@ function updateSelection(mutate: (set: Set<string>) => void): void {
   accountsStore.selectedIds = [...set]
 }
 
-function toggleSelect(id: string, checked: boolean): void {
-  updateSelection((set) => (checked ? set.add(id) : set.delete(id)))
-}
+/** 单击勾选；按住 Shift 勾选一段，Ctrl / Cmd + A 勾选当前筛选结果（见 rangeSelect） */
+const { toggle: toggleSelect } = useRangeSelect({
+  order: () => sorted.value.map((account) => account.id),
+  apply: (ids, checked) =>
+    updateSelection((set) => {
+      for (const id of ids) checked ? set.add(id) : set.delete(id)
+    }),
+  selectAll: () => toggleSelectVisible(true)
+})
 
 /** 全选 / 取消全选当前筛选结果 */
 function toggleSelectVisible(checked: boolean): void {
@@ -619,11 +620,8 @@ function logoutIde(account: Account): void {
           trigger="click"
           placement="bottomRight"
           :get-popup-container="bodyPopupContainer"
-          @open-change="onGroupOpenChange"
+          @open-change="(open: boolean) => (groupOpen = open)"
         >
-          <template #title>
-            <span>分组</span>
-          </template>
           <template #content>
             <GroupPanel
               v-if="groupOpen"
@@ -633,7 +631,7 @@ function logoutIde(account: Account): void {
               entity="账号"
               @toggle="toggleGroupFilter"
               @clear="accountsStore.filter.groupIds = []"
-              @busy="groupBusy = $event"
+              @manage="openGroupManage"
             />
           </template>
           <a-badge :count="accountsStore.filter.groupIds.length" :offset="[-4, 4]">
@@ -647,24 +645,7 @@ function logoutIde(account: Account): void {
           </a-badge>
         </a-popover>
 
-        <a-dropdown>
-          <a-button :size="toolbarSize">
-            <template #icon><SortAscendingOutlined /></template>
-            {{ sortLabel }}
-            <DownOutlined />
-          </a-button>
-          <template #overlay>
-            <a-menu :selected-keys="[sortKey]">
-              <a-menu-item
-                v-for="item in sortOptions"
-                :key="item.value"
-                @click="sortKey = item.value"
-              >
-                {{ item.label }}
-              </a-menu-item>
-            </a-menu>
-          </template>
-        </a-dropdown>
+        <SortMenu v-model="sortKey" :fields="SORT_FIELDS" :size="toolbarSize" />
 
         <a-divider type="vertical" style="margin: 0 2px" />
 
@@ -718,6 +699,10 @@ function logoutIde(account: Account): void {
               <a-menu-item key="group" @click="batchGroupOpen = true">
                 <AppstoreOutlined />
                 批量设置分组
+              </a-menu-item>
+              <a-menu-item key="apikey" @click="batchApiKeyOpen = true">
+                <KeyOutlined />
+                批量生成 API Key
               </a-menu-item>
             </a-menu>
           </template>
@@ -835,12 +820,24 @@ function logoutIde(account: Account): void {
       @submit="applyBatchNote"
       @close="batchNoteOpen = false"
     />
+    <BatchCreateApiKeyModal
+      v-if="batchApiKeyOpen"
+      :accounts="batchApiKeyTargets"
+      @close="batchApiKeyOpen = false"
+    />
     <GroupPickerModal
       v-if="batchGroupOpen"
       :api="groupApi"
       :ids="accountsStore.selectedIds"
       entity="账号"
       @close="batchGroupOpen = false"
+      @manage="groupManageOpen = true"
+    />
+    <GroupManageModal
+      v-if="groupManageOpen"
+      :api="groupApi"
+      entity="账号"
+      @close="groupManageOpen = false"
     />
     <AccountDetailDrawer
       v-if="detailTarget"

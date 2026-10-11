@@ -1,19 +1,19 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { message } from 'ant-design-vue'
-import { CopyOutlined, DeleteOutlined, ReloadOutlined } from '@ant-design/icons-vue'
-import { useAccountsStore } from '@/stores/accounts'
+import { CopyOutlined, DeleteOutlined, KeyOutlined, ReloadOutlined } from '@ant-design/icons-vue'
+import AddApiKeyModal from '@/components/keys/AddApiKeyModal.vue'
 import { useSettingsStore } from '@/stores/settings'
 import { displayEmail } from '@/utils/display'
 import { formatFullDateTime } from '@/utils/format'
 import { toPlain } from '@/utils/ipc'
+import { applyRefreshedCredentials, randomKeyName } from '@/utils/accountApiKey'
 import { confirmDanger, copyText } from '@/utils/ui'
 import type { Account, AccountApiKeyItem, CreateApiKeyResult } from '@shared/types'
 
 const props = defineProps<{ account: Account }>()
 const emit = defineEmits<{ close: [] }>()
 
-const accountsStore = useAccountsStore()
 const settingsStore = useSettingsStore()
 
 const label = ref('')
@@ -28,10 +28,10 @@ const keys = ref<AccountApiKeyItem[]>([])
  * 它对应的弹窗一关就置空，之后列表里只剩前缀，与上游「只给一次」的行为一致。
  */
 const freshKey = ref<CreateApiKeyResult | null>(null)
-/** 用户是否已经复制过，未复制时关闭要二次确认 */
-const copied = ref(false)
+/** 「添加到 API Key 管理」弹窗 */
+const addOpen = ref(false)
 
-/** 明文弹窗要压在管理弹窗之上，二次确认再压在它之上 */
+/** 明文弹窗要压在管理弹窗之上，添加弹窗再压在它之上 */
 const FRESH_MODAL_Z_INDEX = 1100
 
 const email = computed(() => displayEmail(props.account.email, settingsStore.settings.privacyMode))
@@ -46,18 +46,8 @@ const columns = [
 /** 正在删除的 keyId，用于该行按钮的加载态 */
 const deletingId = ref('')
 
-/** 生成过程中可能刷新过凭证，不同步回本地会让下一次请求拿着已作废的旧值 */
 function applyRefreshed(refreshed?: CreateApiKeyResult['refreshed']): void {
-  if (!refreshed) return
-  const latest = accountsStore.get(props.account.id) ?? props.account
-  accountsStore.updateAccount(props.account.id, {
-    credentials: {
-      ...latest.credentials,
-      accessToken: refreshed.accessToken,
-      refreshToken: refreshed.refreshToken,
-      expiresAt: Date.now() + refreshed.expiresIn * 1000
-    }
-  })
+  applyRefreshedCredentials(props.account.id, refreshed)
 }
 
 async function loadList(): Promise<void> {
@@ -77,16 +67,6 @@ async function loadList(): Promise<void> {
   }
 }
 
-/**
- * 名称留空时按时间戳生成一个 8 位随机名（字母数字）。
- * 以毫秒时间戳的 base36 打底，天然递增、不易撞名；不足 8 位时用随机字符补齐。
- */
-function randomKeyName(): string {
-  let s = Date.now().toString(36)
-  while (s.length < 8) s += Math.random().toString(36).slice(2)
-  return s.slice(-8)
-}
-
 async function submit(): Promise<void> {
   // 名称非必填：留空则用时间戳随机名提交
   const name = label.value.trim() || randomKeyName()
@@ -100,7 +80,6 @@ async function submit(): Promise<void> {
     const data = res.data
     applyRefreshed(data.refreshed)
     label.value = ''
-    copied.value = false
     freshKey.value = data
 
     /*
@@ -148,25 +127,11 @@ function removeKey(record: AccountApiKeyItem): void {
 function copyFresh(): void {
   if (!freshKey.value) return
   copyText(freshKey.value.apiKey, '已复制完整 API Key')
-  copied.value = true
 }
 
-/** 关闭明文弹窗即丢弃完整 Key；没复制过就先确认一次 */
+/** 关闭明文弹窗即丢弃完整 Key（顶部提示已说明只显示这一次） */
 function closeFresh(): void {
-  if (copied.value) {
-    freshKey.value = null
-    return
-  }
-  confirmDanger({
-    title: '还没有复制，确认关闭？',
-    content: '完整 API Key 关闭后无法再次获取，列表里只会保留前缀。',
-    okText: '仍然关闭',
-    // 必须高于明文弹窗的 FRESH_MODAL_Z_INDEX，否则确认框被盖住、按钮点不到
-    zIndex: FRESH_MODAL_Z_INDEX + 100,
-    onOk: () => {
-      freshKey.value = null
-    }
-  })
+  freshKey.value = null
 }
 
 onMounted(loadList)
@@ -178,7 +143,6 @@ onMounted(loadList)
     :title="`API Key 管理（${email}）`"
     centered
     width="780px"
-    :mask-closable="false"
     :footer="null"
     wrap-class-name="api-key-modal"
     @cancel="emit('close')"
@@ -291,7 +255,6 @@ onMounted(loadList)
     title="API Key 已生成"
     centered
     width="560px"
-    :mask-closable="false"
     :z-index="FRESH_MODAL_Z_INDEX"
     @cancel="closeFresh"
   >
@@ -318,14 +281,31 @@ onMounted(loadList)
         <div class="key-box mono">{{ freshKey.apiKey }}</div>
       </div>
     </div>
+    <!-- 左侧存进 API Key 管理，右侧关闭与复制 -->
     <template #footer>
-      <a-button @click="closeFresh">关闭</a-button>
-      <a-button type="primary" @click="copyFresh">
-        <template #icon><CopyOutlined /></template>
-        复制 API Key
-      </a-button>
+      <div class="fresh-footer">
+        <a-button @click="addOpen = true">
+          <template #icon><KeyOutlined /></template>
+          添加到 API Key 管理
+        </a-button>
+        <span class="footer-spacer" />
+        <a-button @click="closeFresh">关闭</a-button>
+        <a-button type="primary" @click="copyFresh">
+          <template #icon><CopyOutlined /></template>
+          复制 API Key
+        </a-button>
+      </div>
     </template>
   </a-modal>
+
+  <!-- 预填刚生成的 Key 与它的区域，压在明文弹窗之上 -->
+  <AddApiKeyModal
+    v-if="addOpen && freshKey"
+    :initial-key="freshKey.apiKey"
+    :initial-region="freshKey.region"
+    :z-index="FRESH_MODAL_Z_INDEX + 100"
+    @close="addOpen = false"
+  />
 </template>
 
 <style scoped>
@@ -400,9 +380,6 @@ onMounted(loadList)
   gap: 8px;
 }
 
-.fresh-row.is-key {
-  align-items: flex-start;
-}
 
 .fresh-label {
   flex: 0 0 68px;
@@ -417,6 +394,7 @@ onMounted(loadList)
 /* 完整 Key 很长且没有空格，必须按字符换行，否则会把弹窗顶宽 */
 .key-box {
   flex: 1;
+  min-width: 0;
   padding: 8px 10px;
   border: 1px solid var(--kal-border);
   border-radius: 8px;
@@ -424,6 +402,16 @@ onMounted(loadList)
   font-size: 12px;
   line-height: 1.6;
   word-break: break-all;
+}
+
+.fresh-footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.footer-spacer {
+  flex: 1 1 auto;
 }
 </style>
 

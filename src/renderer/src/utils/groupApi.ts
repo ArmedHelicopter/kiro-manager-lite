@@ -45,7 +45,7 @@ export function accountGroupApi(): GroupApi {
       return { group, created: store.groups.length > before }
     },
     async rename(id, name) {
-      return store.renameGroup(id, name) ? null : '分组名称不能为空'
+      return store.renameGroup(id, name)
     },
     async remove(id) {
       store.removeGroup(id)
