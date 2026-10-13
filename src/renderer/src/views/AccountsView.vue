@@ -4,6 +4,7 @@ import { message } from 'ant-design-vue'
 import {
   AppstoreOutlined,
   CodeOutlined,
+  CrownOutlined,
   DeleteOutlined,
   DownOutlined,
   DownloadOutlined,
@@ -31,6 +32,7 @@ import GroupPickerModal from '@/components/common/GroupPickerModal.vue'
 import GroupPanel from '@/components/common/GroupPanel.vue'
 import GroupManageModal from '@/components/common/GroupManageModal.vue'
 import BatchCreateApiKeyModal from '@/components/accounts/BatchCreateApiKeyModal.vue'
+import BatchSubscriptionModal from '@/components/accounts/BatchSubscriptionModal.vue'
 import SortMenu from '@/components/common/SortMenu.vue'
 import { useRangeSelect } from '@/utils/rangeSelect'
 import { DEFAULT_SORT, SORT_FIELDS, compareBy, type SortField, type SortKey } from '@/utils/listSort'
@@ -80,9 +82,10 @@ const exportOpen = ref(false)
 const batchNoteOpen = ref(false)
 const batchGroupOpen = ref(false)
 const batchApiKeyOpen = ref(false)
+const batchSubscriptionOpen = ref(false)
 
-/** 批量生成的目标：全部勾选项，按界面当前排序，被筛掉的勾选项排在后面 */
-const batchApiKeyTargets = computed(() => {
+/** 批量生成 Key / 订阅链接的目标：全部勾选项，按界面当前排序，被筛掉的勾选项排在后面 */
+const batchTargets = computed(() => {
   const selected = new Set(accountsStore.selectedIds)
   const visible = sorted.value.filter((account) => selected.has(account.id))
   const shown = new Set(visible.map((account) => account.id))
@@ -704,6 +707,10 @@ function logoutIde(account: Account): void {
                 <KeyOutlined />
                 批量生成 API Key
               </a-menu-item>
+              <a-menu-item key="subscription" @click="batchSubscriptionOpen = true">
+                <CrownOutlined />
+                批量生成订阅链接
+              </a-menu-item>
             </a-menu>
           </template>
         </a-dropdown>
@@ -822,8 +829,13 @@ function logoutIde(account: Account): void {
     />
     <BatchCreateApiKeyModal
       v-if="batchApiKeyOpen"
-      :accounts="batchApiKeyTargets"
+      :accounts="batchTargets"
       @close="batchApiKeyOpen = false"
+    />
+    <BatchSubscriptionModal
+      v-if="batchSubscriptionOpen"
+      :accounts="batchTargets"
+      @close="batchSubscriptionOpen = false"
     />
     <GroupPickerModal
       v-if="batchGroupOpen"

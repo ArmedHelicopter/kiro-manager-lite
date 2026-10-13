@@ -58,6 +58,7 @@ import type {
   LogQueryResult,
   ProactiveRenewalPayload,
   SubscriptionEntry,
+  SubscriptionPlan,
   SwitchAccountInput,
   SwitchAccountResult,
   TrayAction,
@@ -157,11 +158,14 @@ export interface Api {
   openAccountPortal: (account: Account) => Promise<IpcResult<{ url: string }>>
   /** 查订阅入口：已订阅返回 Stripe 账单管理链接，未订阅返回可开通档位 */
   getSubscriptionEntry: (account: Account) => Promise<IpcResult<SubscriptionEntry>>
-  /** 为指定档位生成 Stripe 结算链接 */
+  /** 为指定档位生成 Stripe 结算链接；rejectSubscribed 为真时已订阅的账号直接报错 */
   createSubscriptionCheckout: (
     account: Account,
-    subscriptionType: string
+    subscriptionType: string,
+    rejectSubscribed?: boolean
   ) => Promise<IpcResult<{ url: string }>>
+  /** 只查可开通档位（不判断是否已订阅） */
+  listSubscriptionPlans: (account: Account) => Promise<IpcResult<SubscriptionPlan[]>>
   /** 用内置浏览器打开链接 */
   openInAppBrowser: (url: string, title?: string) => Promise<IpcResult<{ url: string }>>
 

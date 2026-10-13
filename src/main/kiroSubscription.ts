@@ -167,13 +167,33 @@ export async function getSubscriptionEntry(account: Account): Promise<Subscripti
   return { plans: parsePlans(res.subscriptionPlans), disclaimer: res.disclaimer ?? [] }
 }
 
-/** 为指定档位生成 Stripe 结算链接 */
+/** 只查可开通档位，不看这个账号是否已订阅：批量订阅用它给所有账号取一份档位列表 */
+export async function listSubscriptionPlans(account: Account): Promise<SubscriptionPlan[]> {
+  const session = await openCsrfSession(account)
+  const res = await csrfOperation<{ subscriptionPlans?: RawPlan[] }>(
+    'GetAvailableSubscriptionPlans',
+    {},
+    session
+  )
+  return parsePlans(res.subscriptionPlans)
+}
+
+/**
+ * 为指定档位生成 Stripe 结算链接。
+ *
+ * 已订阅的账号调这个接口拿到的是它现有订阅的账单管理页，不是新档位的结算页。
+ * rejectSubscribed 为真时先查一次账单管理链接，能查到就判为已有订阅、直接报错（批量订阅用）。
+ */
 export async function createSubscriptionCheckout(
   account: Account,
-  subscriptionType: string
+  subscriptionType: string,
+  rejectSubscribed = false
 ): Promise<{ url: string }> {
   if (!subscriptionType) throw new Error('缺少订阅类型')
   const session = await openCsrfSession(account)
+  if (rejectSubscribed && (await tryManageUrl(session))) {
+    throw new Error('该账号已有订阅，不能再生成新的订阅链接')
+  }
   const res = await csrfOperation<{ encodedVerificationUrl?: string }>(
     'GenerateSubscriptionManagementUrl',
     { subscriptionType },

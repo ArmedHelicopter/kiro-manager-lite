@@ -53,8 +53,10 @@ const api = {
   /** 查订阅入口：已订阅返回账单管理链接，未订阅返回可开通档位 */
   getSubscriptionEntry: (account: unknown) => invoke('accounts:subscription-entry', account),
   /** 为指定档位生成 Stripe 结算链接 */
-  createSubscriptionCheckout: (account: unknown, subscriptionType: string) =>
-    invoke('accounts:subscription-checkout', account, subscriptionType),
+  createSubscriptionCheckout: (account: unknown, subscriptionType: string, rejectSubscribed?: boolean) =>
+    invoke('accounts:subscription-checkout', account, subscriptionType, rejectSubscribed),
+  /** 只查可开通档位（不判断是否已订阅） */
+  listSubscriptionPlans: (account: unknown) => invoke('accounts:subscription-plans', account),
   /** 用内置浏览器打开链接 */
   openInAppBrowser: (url: string, title?: string) =>
     invoke('app:open-in-app-browser', url, title),

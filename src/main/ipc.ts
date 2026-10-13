@@ -13,7 +13,7 @@ import {
 } from './accountService'
 import { createAccountApiKey, deleteAccountApiKey, listAccountApiKeys } from './kiroApiKey'
 import { openAccountPortal, openInAppUrl } from './kiroPortal'
-import { createSubscriptionCheckout, getSubscriptionEntry } from './kiroSubscription'
+import { createSubscriptionCheckout, getSubscriptionEntry, listSubscriptionPlans } from './kiroSubscription'
 import { clearKiroSsoCache, readKiroAuthToken, readLocalKiroCredentials, ssoCacheFile } from './kiroAuth'
 import { restartKiroIde } from './kiroProcess'
 import { chatTraceOf, listKiroModels, streamApiKeyChat, streamKiroChat } from './kiroChat'
@@ -284,8 +284,14 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
     ok(await getSubscriptionEntry(account))
   )
 
-  handle('accounts:subscription-checkout', async (_e, account: Account, subscriptionType: string) =>
-    ok(await createSubscriptionCheckout(account, subscriptionType))
+  handle(
+    'accounts:subscription-checkout',
+    async (_e, account: Account, subscriptionType: string, rejectSubscribed?: boolean) =>
+      ok(await createSubscriptionCheckout(account, subscriptionType, !!rejectSubscribed))
+  )
+
+  handle('accounts:subscription-plans', async (_e, account: Account) =>
+    ok(await listSubscriptionPlans(account))
   )
 
   /** 用内置浏览器打开链接（Stripe 账单 / 结算页） */
