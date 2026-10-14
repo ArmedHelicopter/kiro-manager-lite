@@ -46,7 +46,8 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          # 需 >= 22.19：undici 8 / chalk 6 / electron-store 12 的最低要求
+          node-version: 22.19
           cache: npm
 
       # 兜底：任何依赖触发 node-gyp 时都需要 distutils，

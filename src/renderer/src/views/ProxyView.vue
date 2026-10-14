@@ -752,9 +752,18 @@ function streamDetail(entry: ProxyLogEntry): string {
  * 秒数输入框的统一处理：清空或输错时回落默认值，不让「没填」变成 0 或 NaN 存下去。
  * 合法值夹到范围内并取整。
  */
-function secondsOr(v: unknown, min: number, max: number, fallback: number): number {
-  if (typeof v !== 'number' || !Number.isFinite(v)) return fallback
-  return Math.min(max, Math.max(min, Math.round(v)))
+const SECONDS_RANGE = {
+  upstreamKeepAliveSec: [KEEP_ALIVE_MIN_SEC, KEEP_ALIVE_MAX_SEC],
+  heartbeatIntervalSec: [HEARTBEAT_MIN_SEC, HEARTBEAT_MAX_SEC]
+} as const
+
+function patchSeconds(key: keyof typeof SECONDS_RANGE, v: unknown): void {
+  const [min, max] = SECONDS_RANGE[key]
+  const value =
+    typeof v === 'number' && Number.isFinite(v)
+      ? Math.min(max, Math.max(min, Math.round(v)))
+      : DEFAULT_PROXY_CONFIG[key]
+  void patch({ [key]: value })
 }
 
 /** 当前弹窗对应客户端的进度日志 */
@@ -1401,17 +1410,7 @@ onUnmounted(() => stop?.())
               :max="KEEP_ALIVE_MAX_SEC"
               :placeholder="String(DEFAULT_PROXY_CONFIG.upstreamKeepAliveSec)"
               style="width: 120px"
-              @change="
-                (v: any) =>
-                  patch({
-                    upstreamKeepAliveSec: secondsOr(
-                      v,
-                      KEEP_ALIVE_MIN_SEC,
-                      KEEP_ALIVE_MAX_SEC,
-                      DEFAULT_PROXY_CONFIG.upstreamKeepAliveSec
-                    )
-                  })
-              "
+              @change="(v: unknown) => patchSeconds('upstreamKeepAliveSec', v)"
             />
           <span class="muted">秒后断开</span>
           <span class="field-hint muted">
@@ -1443,17 +1442,7 @@ onUnmounted(() => stop?.())
               :max="HEARTBEAT_MAX_SEC"
               :placeholder="String(DEFAULT_PROXY_CONFIG.heartbeatIntervalSec)"
               style="width: 120px"
-              @change="
-                (v: any) =>
-                  patch({
-                    heartbeatIntervalSec: secondsOr(
-                      v,
-                      HEARTBEAT_MIN_SEC,
-                      HEARTBEAT_MAX_SEC,
-                      DEFAULT_PROXY_CONFIG.heartbeatIntervalSec
-                    )
-                  })
-              "
+              @change="(v: unknown) => patchSeconds('heartbeatIntervalSec', v)"
             />
             <span class="muted">秒发一次</span>
           </div>

@@ -1,4 +1,12 @@
-import { BrowserWindow, dialog, ipcMain, shell, app, type IpcMainInvokeEvent } from 'electron'
+import {
+  BrowserWindow,
+  clipboard,
+  dialog,
+  ipcMain,
+  shell,
+  app,
+  type IpcMainInvokeEvent
+} from 'electron'
 import { readFile, writeFile } from 'fs/promises'
 import { existsSync } from 'fs'
 import { dirname, extname, join } from 'path'
@@ -857,6 +865,15 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
 
   handle('tray:sync', (_e, data: TraySnapshot) => {
     setTraySnapshot(data)
+    return ok()
+  })
+
+  /*
+   * 剪贴板写入只能在主进程做：Electron 44 起 clipboard 模块不再暴露给渲染进程。
+   * 写入本身是异步的（44 起 writeText 返回 Promise），要 await 后再回结果。
+   */
+  handle('clipboard:write', async (_e, text: string) => {
+    await clipboard.writeText(typeof text === 'string' ? text : String(text ?? ''))
     return ok()
   })
 

@@ -1,5 +1,5 @@
 import { resolve } from 'path'
-import { defineConfig, externalizeDepsPlugin } from 'electron-vite'
+import { defineConfig } from 'electron-vite'
 import vue from '@vitejs/plugin-vue'
 import Components from 'unplugin-vue-components/vite'
 import { AntDesignVueResolver } from 'unplugin-vue-components/resolvers'
@@ -10,17 +10,21 @@ import dayjs from 'dayjs'
 const buildStamp = dayjs().format('YYYYMMDDHHmmss')
 const buildTime = dayjs().format('YYYY-MM-DD HH:mm:ss')
 
+// main / preload 的依赖默认外置（electron-vite 5 起 build.externalizeDeps 默认开启）
 export default defineConfig({
   main: {
-    plugins: [externalizeDepsPlugin()],
     build: {
+      /*
+       * electron-store 自 9.x 起只发 ESM，而主进程产物是 CJS，外置后 require() 它会直接抛错。
+       * 这里把它和其依赖打进产物（其余依赖照旧外置）。
+       */
+      externalizeDeps: { exclude: ['electron-store'] },
       rollupOptions: {
         input: { index: resolve(__dirname, 'src/main/index.ts') }
       }
     }
   },
   preload: {
-    plugins: [externalizeDepsPlugin()],
     build: {
       rollupOptions: {
         input: {

@@ -80,11 +80,13 @@ dmg:
   # 开着时可视高度会少五十点左右，图标压得太低就会出现滚动条。
   contents:
     # 安装指南（纯文本，双击用「文本编辑」打开）：说明 macOS 首次打开被拦截的处理办法，
-    # 避免用户把安全拦截误当成安装失败。文件放在 build/ 下，path 相对 buildResources 解析。
+    # 避免用户把安全拦截误当成安装失败。
+    # path 自 electron-builder 26 起不再按 buildResources 解析，而是原样交给 dmgbuild
+    # （相对工程根目录），所以这里要写成 build/ 开头；只写文件名会报 FileNotFoundError。
     - x: 280
       y: 60
       type: file
-      path: 安装指南.txt
+      path: build/安装指南.txt
       name: 安装指南.txt
     - x: 140
       y: 180
@@ -93,25 +95,13 @@ dmg:
       y: 180
       type: link
       path: /Applications
-    # 卷上的隐藏文件：打包工具默认把它们放在 x=2560 以外，
-    # 开着「显示隐藏文件」的用户打开 DMG 就会出现横竖滚动条、内容显示不全。
-    # 只写 name 不写 path 时只设位置、不拷文件；放进窗口两侧上角，平时看不见，显示隐藏文件时也不出界
-    - x: 60
-      y: 60
-      type: file
-      name: .background
-    - x: 60
-      y: 60
-      type: file
-      name: .Trashes
-    - x: 500
-      y: 60
-      type: file
-      name: .VolumeIcon.icns
-    - x: 500
-      y: 60
-      type: file
-      name: .fseventsd
+    # 这里原本还给卷上的隐藏文件（.background / .Trashes / .VolumeIcon.icns / .fseventsd）
+    # 各写了一条只有 name、没有 path 的条目，用来把它们挪进窗口角落，
+    # 这样开着「显示隐藏文件」的用户打开 DMG 不会出现滚动条。
+    # electron-builder 26 起不能再这么写：缺 path 的 file 条目会被填上 .app 的路径
+    # （dmgUtil 里的 `path: c.path || appPath`），dmgbuild 于是去把整个 .app
+    # 拷成 .VolumeIcon.icns，直接构建失败。没有替代写法，只能去掉这几条。
+    # 代价是开了显示隐藏文件的用户可能看到滚动条，属于观感问题。
 pkg:
   # 固定装到 /Applications；不允许重定位：否则机器上已有同 bundle id 的副本（比如在下载目录里双击过）时，
   # 安装器会把新版本装到那个副本的位置，用户在「应用程序」里看到的还是旧版

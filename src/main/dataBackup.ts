@@ -24,6 +24,7 @@ import {
   getKeyData,
   getProxyApiKeys,
   getProxyConfig,
+  PRE_UPGRADE_STORE_COPY,
   resetStoreData,
   saveProxyConfig,
   setAccountData,
@@ -239,6 +240,10 @@ export function wipeLocalData(): void {
   for (const dir of [getBackupDir(), path.join(userData, 'login-browser')]) {
     if (existsSync(dir)) rmSync(dir, { recursive: true, force: true })
   }
+  // 升级到 electron-store 12 时留下的主库副本（见 store.backupBeforeStoreFormatChange），
+  // 里面也是账号凭证，清除全部数据时必须一起删掉
+  const legacyCopy = path.join(userData, `${PRE_UPGRADE_STORE_COPY}.json`)
+  if (existsSync(legacyCopy)) rmSync(legacyCopy, { force: true })
 }
 
 /** 渲染层自己的小状态（定时任务上次执行时间、更新检查缓存等）也一并清掉 */

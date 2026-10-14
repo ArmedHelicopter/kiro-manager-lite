@@ -63,7 +63,8 @@ async function showAbout(deps: AppMenuDeps): Promise<void> {
   const { response } = parent
     ? await dialog.showMessageBox(parent, options)
     : await dialog.showMessageBox(options)
-  if (response === 1) clipboard.writeText(`${APP_NAME}\n${detail}`)
+  // writeText 自 Electron 44 起返回 Promise；这里不等它，失败也不该影响菜单
+  if (response === 1) void clipboard.writeText(`${APP_NAME}\n${detail}`).catch(() => undefined)
 }
 
 // ============ 菜单项 ============

@@ -3,6 +3,50 @@
 本文件记录 Kiro Manager Lite 的版本变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.0.38] - 2026-10-14
+
+本版本把全部依赖升到当前可用的最新版本（Electron 44、Vite 7、Pinia 4、Vue Router 5、electron-store 12 等），
+并修掉反代在长会话里会「只出思考、不出正文」和工具调用被当成文本输出的问题。
+
+### 重要变更
+
+- **macOS 最低版本从 11 Big Sur 提高到 13 Ventura**：Electron 44 所基于的 Chromium 已停止支持 macOS 12 及更早版本。
+  仍在 macOS 11 / 12 的用户请继续使用 v1.0.37。Windows 10 与 Linux 的门槛不变
+- 账号数据的加密格式随 electron-store 12 发生变化。升级会自动读旧格式，无需任何操作；
+  首次启动前会把原文件另存一份 `kiro-account-lite.pre-v1038.json`，
+  万一需要退回 v1.0.37，把它改回 `kiro-account-lite.json` 即可（「清除全部数据」会连这份副本一起删除）
+
+### 修复
+
+- 激活账号只有邮箱与 refreshToken（最短可回导格式）时，启动阶段读取 Token 有效期会抛异常，
+  导致后面的自动备份与托盘初始化被整段跳过——表现为定时备份不执行、托盘图标不出现
+- 账号 / API Key 列表滚动时日志里刷出大量 `ResizeObserver loop completed with undelivered notifications`：
+  卡片网格量高度的写入改到下一帧，不再在观察回调里改尺寸
+- 反代：历史里更早的工具调用不再写成「[Called tool xxx]」这类文本。长会话里这种文本会累积成几十个示例，
+  模型学会后就把它当回复输出，不再发起真正的工具调用，客户端因此报错。工具名改标在对应的工具结果上，
+  历史里已被污染的文本也会在回传前清掉
+- 反代：工具调用被压成文本后留下的空壳回复（只剩一个占位符）会被清理。长会话里这类空回复同样会被模型模仿，
+  表现为只输出一点思考就结束
+- 反代：当前这一轮的工具结果改为按 id 校正后再配对——重复结果只留一条，不属于这一轮的不进结构化字段，
+  并行调用缺的那个补一条错误结果。此前要求两边完全一致，对不上就整轮退化成文本
+
+### 优化
+
+- 适配 Electron 44 的接口调整：剪贴板写入改由主进程执行（44 起渲染进程不再暴露该模块），
+  渲染进程日志转发改用新的 `console-message` 事件签名
+- 上游请求继续固定走 HTTP/1.1：undici 8 起默认开启 HTTP/2，协商成功就自动升级。
+  上游的流式接口与用户本地各类代理在 h2 下的行为都没验证过（走代理时还是 h2-over-CONNECT），
+  因此显式关掉，保持与升级前一致
+- macOS 的 DMG 打包适配 electron-builder 26：`dmg.contents` 的 `path` 不再按 `buildResources` 解析，
+  安装指南改用 `build/` 开头的路径；同时去掉隐藏文件的定位条目（26 下会导致构建失败）
+- 开发环境要求 Node >= 22.19（undici 8 / chalk 6 / electron-store 12 的下限），CI 同步固定到该版本
+- 依赖升级：Electron 35 → 44、Vite 6 → 7、electron-vite 3 → 5、@vitejs/plugin-vue 5 → 6、Pinia 3 → 4、
+  Vue Router 4 → 5、electron-store 8 → 12、undici 7 → 8、TypeScript 5.8 → 6、vue-tsc 2 → 3、chalk 5 → 6、
+  electron-builder 25 → 26，以及 Vue、dayjs、marked、terser、dompurify、cbor-x 等的小版本更新
+- 反代：请求体超限裁掉最旧历史时，在裁剪处留一句说明，模型不会把残缺的历史当成完整对话
+- 历史里的 user / assistant 轮次保证严格交替：合并相邻同角色消息，必要时补占位轮，
+  并把重复的工具结果折叠成一条
+
 ## [1.0.37] - 2026-10-13
 
 本版本新增账号批量生成订阅链接与上下布局，反代 Key 统计支持按日期范围查看并保留全部用量明细。

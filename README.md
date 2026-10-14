@@ -13,12 +13,12 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.0.37-6c5ce7" alt="version">
-  <img src="https://img.shields.io/badge/updated-2026--10--13-2f9e44" alt="updated">
+  <img src="https://img.shields.io/badge/version-1.0.38-6c5ce7" alt="version">
+  <img src="https://img.shields.io/badge/updated-2026--10--14-2f9e44" alt="updated">
   <img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey" alt="platform">
   <img src="https://img.shields.io/badge/Vue-3-42b883" alt="vue">
-  <img src="https://img.shields.io/badge/Electron-35-47848f" alt="electron">
+  <img src="https://img.shields.io/badge/Electron-44-47848f" alt="electron">
 </p>
 
 ---
@@ -178,14 +178,14 @@
 
 <p align="center">
   <a href="https://github.com/lucks-cloud/kiro-manager-lite/releases/latest">
-    <img src="https://img.shields.io/badge/⬇%20下载最新版-v1.0.37-6c5ce7?style=for-the-badge" alt="下载最新版">
+    <img src="https://img.shields.io/badge/⬇%20下载最新版-v1.0.38-6c5ce7?style=for-the-badge" alt="下载最新版">
   </a>
   <a href="https://github.com/lucks-cloud/kiro-manager-lite/releases">
     <img src="https://img.shields.io/badge/全部版本-Releases-24292f?style=for-the-badge&logo=github" alt="全部版本">
   </a>
 </p>
 
-**最新版本：v1.0.37**（2026-10-13） · 变更详情见 [CHANGELOG.md](CHANGELOG.md)
+**最新版本：v1.0.38**（2026-10-14） · 变更详情见 [CHANGELOG.md](CHANGELOG.md)
 
 ### 选择对应的安装包
 
@@ -204,11 +204,13 @@
 
 | 平台 | 最低版本 | 架构 |
 | --- | --- | --- |
-| macOS | 11 Big Sur | arm64 / x64 |
+| macOS | 13 Ventura | arm64 / x64 |
 | Windows | Windows 10 | 仅 x64 |
 | Linux | 主流发行版（Ubuntu / Debian / Fedora 等仍在维护的版本） | 仅 x64 |
 
-版本门槛跟随 Electron 35（Chromium 134）的[平台支持范围](https://github.com/electron/electron#platform-support)。
+版本门槛跟随 Electron 44（Chromium 152）的[平台支持范围](https://github.com/electron/electron#platform-support)。
+**macOS 最低版本自 v1.0.38 起从 11 Big Sur 提高到 13 Ventura**（Chromium 已停止支持 macOS 12 及更早版本）；
+仍在 macOS 11 / 12 的用户请继续使用 [v1.0.37](https://github.com/lucks-cloud/kiro-manager-lite/releases/tag/v1.0.37)。
 Windows 与 Linux 暂不提供 arm64 包：原生依赖 `cbor-extract` 没有对应的预编译产物，
 交叉编译在 CI 上必然失败。装机后约占 300–400 MB。
 
@@ -293,7 +295,7 @@ Windows 与 Linux 暂不提供 arm64 包：原生依赖 `cbor-extract` 没有对
 | 层 | 选型 |
 | --- | --- |
 | 前端框架 | Vue 3 + TypeScript |
-| 桌面框架 | Electron 35 |
+| 桌面框架 | Electron 44 |
 | 状态管理 | Pinia |
 | UI 组件 | Ant Design Vue 4 |
 | 构建工具 | Vite + electron-vite |
@@ -414,7 +416,7 @@ src/
 
 ## 🔖 更新日志
 
-各版本变更记录见 [CHANGELOG.md](CHANGELOG.md)，当前版本 v1.0.37，最后更新于 2026-10-13。
+各版本变更记录见 [CHANGELOG.md](CHANGELOG.md)，当前版本 v1.0.38，最后更新于 2026-10-14。
 
 ---
 

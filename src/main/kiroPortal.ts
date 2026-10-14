@@ -648,7 +648,8 @@ function popupBarMenu(win: BaseWindow, wc: Electron.WebContents): void {
     {
       label: '复制链接',
       enabled: !!url && !url.startsWith('data:'),
-      click: () => clipboard.writeText(url)
+      // writeText 自 Electron 44 起返回 Promise，失败不该冒成未处理的拒绝
+      click: () => void clipboard.writeText(url).catch(() => undefined)
     },
     {
       // 这里是用户显式选择才外跳，和「点链接自动跳到系统浏览器」是两回事。

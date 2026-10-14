@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer, clipboard } from 'electron'
+import { contextBridge, ipcRenderer } from 'electron'
 import { createHash } from 'crypto'
 
 /**
@@ -143,7 +143,13 @@ const api = {
   /** 打包导出：多个文件装进一个 zip */
   exportToZip: (bundle: unknown, filename: string) =>
     invoke('file:export-zip', bundle, filename),
-  writeClipboard: (text: string) => clipboard.writeText(text),
+  /*
+   * 交给主进程写剪贴板：Electron 44 起 clipboard 模块不再暴露给渲染进程（含 preload），
+   * 直接用会拿到 undefined。调用方不关心结果，这里不等它返回。
+   */
+  writeClipboard: (text: string) => {
+    void invoke('clipboard:write', text)
+  },
 
   // 设置 / 应用
   getSettings: () => invoke('settings:get'),

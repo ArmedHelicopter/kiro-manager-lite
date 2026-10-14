@@ -106,12 +106,14 @@ function createWindow(): void {
    * 打包后的应用没法随手开 DevTools，自动刷新之类的问题只能靠日志定位，
    * 这里只转发本应用自己打的 [Xxx] 前缀日志与错误，避免第三方库的噪音。
    */
-  mainWindow.webContents.on('console-message', (_e, level, message) => {
-    // 只关心本应用自己打的 [Xxx] 前缀日志与警告以上级别，避免第三方库刷屏
+  // level 自 Electron 35 起是字符串（info / warning / error / debug），旧的位置参数已废弃
+  mainWindow.webContents.on('console-message', ({ level, message }) => {
     if (typeof message !== 'string') return
-    if (level < 2 && !message.startsWith('[')) return
+    const important = level === 'warning' || level === 'error'
+    // 只关心本应用自己打的 [Xxx] 前缀日志与警告以上级别，避免第三方库刷屏
+    if (!important && !message.startsWith('[')) return
     // 直接进日志中心：不走 console 是为了保留渲染层原本的 [Xxx] 分类前缀
-    log(level >= 3 ? 'error' : level === 2 ? 'warn' : 'info', message)
+    log(level === 'error' ? 'error' : level === 'warning' ? 'warn' : 'info', message)
   })
 
   // 关闭按钮：启用托盘时按设置决定最小化到托盘还是退出，实现后台常驻。

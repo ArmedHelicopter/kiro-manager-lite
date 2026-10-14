@@ -217,6 +217,24 @@ function measure(): void {
 
 let viewportObserver: ResizeObserver | null = null
 let gridObserver: ResizeObserver | null = null
+let measureFrame = 0
+
+/**
+ * 把 measure 推到下一帧再执行。
+ *
+ * measure 会改 itemHeight，grid 高度随之变化，又会触发同一个 ResizeObserver；
+ * 在回调里同步改尺寸，Chromium 判定为「这一帧还有没派发完的通知」，
+ * 往控制台打一条 ResizeObserver loop completed with undelivered notifications。
+ * 那条提示本身无害（浏览器会顺延到下一帧），但会刷满错误日志。
+ * 放到下一帧量，写入就不在观察回调内，提示不再出现，校正效果不变。
+ */
+function scheduleMeasure(): void {
+  if (measureFrame) return
+  measureFrame = requestAnimationFrame(() => {
+    measureFrame = 0
+    measure()
+  })
+}
 
 onMounted(() => {
   const el = viewport.value
@@ -232,7 +250,7 @@ onMounted(() => {
 
   // 内容变高会带动 grid 尺寸变化，借此触发一次校正
   if (grid.value) {
-    gridObserver = new ResizeObserver(() => measure())
+    gridObserver = new ResizeObserver(scheduleMeasure)
     gridObserver.observe(grid.value)
   }
   void nextTick(measure)
@@ -241,6 +259,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   viewportObserver?.disconnect()
   gridObserver?.disconnect()
+  if (measureFrame) cancelAnimationFrame(measureFrame)
 })
 
 // 列数变化时卡片宽度变了，内容换行情况可能不同，重新量一次

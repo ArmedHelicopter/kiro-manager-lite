@@ -11,9 +11,26 @@ import { Agent, ProxyAgent, fetch as undiciFetch, type Dispatcher, type RequestI
 const DEFAULT_KEEP_ALIVE_MS = 60_000
 let keepAliveMs = DEFAULT_KEEP_ALIVE_MS
 
-function keepAliveOptions(): { keepAliveTimeout: number; keepAliveMaxTimeout: number } {
-  // 上限至少 10 分钟，且不小于用户设的值，否则 undici 会把服务端提示夹到更短
-  return { keepAliveTimeout: keepAliveMs, keepAliveMaxTimeout: Math.max(10 * 60_000, keepAliveMs) }
+function keepAliveOptions(): {
+  keepAliveTimeout: number
+  keepAliveMaxTimeout: number
+  allowH2: false
+} {
+  return {
+    // 上限至少 10 分钟，且不小于用户设的值，否则 undici 会把服务端提示夹到更短
+    keepAliveTimeout: keepAliveMs,
+    keepAliveMaxTimeout: Math.max(10 * 60_000, keepAliveMs),
+    /*
+     * 固定走 HTTP/1.1。
+     *
+     * undici 8 起 allowH2 默认为 true，ALPN 会带上 h2，服务端支持就自动升到 HTTP/2。
+     * 上游（Kiro / AWS 的流式接口）和用户本地的各种代理在 h2 下的行为都没验证过，
+     * 走代理时更是 h2-over-CONNECT，部分本地代理会处理不当，
+     * 表现为莫名的 fetch failed 或流式回复卡住。
+     * 这里显式关掉，保持与升级前完全一致的协议行为；要上 h2 应该单独改、单独测。
+     */
+    allowH2: false
+  }
 }
 
 /** 不走代理时用的连接池：同样按设置放宽保持时间（全局默认的那个是 4 秒） */

@@ -63,7 +63,12 @@ export function scheduleForActiveAccount(): void {
     return
   }
   const account = data.accounts.find((a) => a.id === activeId)
-  const expiresAt = account?.credentials.expiresAt
+  /*
+   * credentials 也要可选链：只带邮箱与 refreshToken 导入的账号（最短可回导格式）
+   * 这一层可能就是空的，少了问号这里会抛 TypeError。
+   * 它跑在 app ready 的启动链里，一抛后面的自动备份与托盘初始化就全被跳过了。
+   */
+  const expiresAt = account?.credentials?.expiresAt
   if (typeof expiresAt === 'number' && expiresAt > 0) {
     scheduleProactiveRenewal(activeId, expiresAt)
   } else {

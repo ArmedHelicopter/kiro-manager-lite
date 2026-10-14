@@ -166,6 +166,8 @@ const TOOL_DESC_LIMIT = 10_000
 const DEFAULT_PAYLOAD_BYTES = 153_600 * 1024
 /** 超限时，历史里单条消息截到这么长 */
 const HISTORY_TRUNCATE_CHARS = 4_000
+const TRUNCATED_NOTE =
+  "[Earlier conversation history was truncated to fit the model's input limit. Older messages and tool activity have been omitted.]"
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -566,21 +568,113 @@ function mergeMessages(messages: NormMessage[]): NormMessage[] {
   return out
 }
 
-/** 工具结果压成可读文本，供历史里的旧轮次使用 */
-function narrateToolResults(results: NormToolResult[]): string {
+/**
+ * 工具结果压成可读文本，供历史里的旧轮次使用。
+ * 工具名只标在 user 侧的结果上：assistant 侧一旦出现「调用了某工具」的文本，
+ * 模型会照着历史把这段文字当回复输出，而不是发起真正的结构化工具调用。
+ */
+function narrateToolResults(results: NormToolResult[], toolNames: Map<string, string>): string {
   if (!results.length) return ''
   const body = results
-    .map((result) => result.content.map((c) => c.text).join('\n'))
+    .map((result) => {
+      const text = result.content.map((c) => c.text).join('\n')
+      const name = toolNames.get(result.toolUseId)
+      return name ? `[${name}] ${text || '(no output)'}` : text
+    })
     .filter(Boolean)
-    .join('\n')
+    .join('\n\n')
   return body ? `Tool results:\n\n${body.slice(0, 4000)}` : ''
 }
 
-function userContent(message: NormMessage): string {
-  const parts = [message.text, narrateToolResults(message.toolResults)].filter(Boolean)
+/** 客户端可能把模型误输出的「[Called tool xxx]」存进了历史，回传前清掉，避免继续被模仿 */
+const POLLUTED_TOOL_TEXT = /\[Called tool [^\]]*\]/g
+
+function stripPollutedToolText(text: string): string {
+  if (!text.includes('[Called tool ')) return text
+  return text.replace(POLLUTED_TOOL_TEXT, '').replace(/\n{3,}/g, '\n\n').trim()
+}
+
+function userContent(message: NormMessage, toolNames: Map<string, string>): string {
+  const parts = [message.text, narrateToolResults(message.toolResults, toolNames)].filter(Boolean)
   const text = parts.join('\n\n')
   if (text) return text
   return message.images.length ? IMAGE_ONLY_TEXT : EMPTY_TEXT
+}
+
+/** 历史里一条 user 消息的有效正文；「.」占位视为空 */
+function realText(value: unknown): string {
+  const text = str(value).trim()
+  return text === EMPTY_TEXT ? '' : text
+}
+
+/** 两段 user 正文合并；后一段与前一段末尾完全相同时不重复追加（卡在重试循环里的客户端会反复发同样的工具结果） */
+function joinUserText(prev: string, next: string): string {
+  if (!next || prev === next || prev.endsWith(`\n\n${next}`)) return prev
+  return prev ? `${prev}\n\n${next}` : next
+}
+
+interface HistoryTail {
+  text: string
+  images: KiroImage[]
+}
+
+/**
+ * 历史拼好后的最后一道整理，保证发给 Kiro 的 history 满足它的硬性要求，同时不给模型留下可模仿的坏样本：
+ *
+ *  1. 去掉空壳 assistant 轮次（只剩「.」占位、没有结构化 toolUses）。
+ *     这类轮次多是工具调用被拍平后留下的，长会话里攒上几十条，模型会照着学成「什么都不说」，
+ *     表现为只出一点思考就结束。工具做了什么已经写在相邻 user 轮的结果文本里，删掉不丢信息。
+ *  2. 删完后相邻的 user 轮合并成一条（相同内容只留一份），保持严格交替。
+ *  3. assistant 打头、或紧跟在另一条 assistant 后面时（系统提示那一对后面直接是 assistant），
+ *     前面补一条占位 user：Kiro 要求 history 从 user 开始且严格交替。
+ *  4. 末尾剩下的 user 轮返回给调用方并入当前消息，保证 history 以 assistant 收尾。
+ */
+function normalizeHistory(history: Record<string, unknown>[], modelId?: string): HistoryTail {
+  const kept: Record<string, unknown>[] = []
+  for (const item of history) {
+    const assistant = asRecord(item.assistantResponseMessage)
+    if (assistant) {
+      const hollow = !Array.isArray(assistant.toolUses) && !realText(assistant.content)
+      if (hollow) continue
+      if (!kept.length || kept[kept.length - 1].assistantResponseMessage) {
+        kept.push({
+          userInputMessage: { content: EMPTY_TEXT, ...(modelId ? { modelId } : {}), origin: 'AI_EDITOR' }
+        })
+      }
+      kept.push(item)
+      continue
+    }
+    const user = asRecord(item.userInputMessage)
+    const prev = asRecord(kept[kept.length - 1]?.userInputMessage)
+    if (user && prev) {
+      prev.content = joinUserText(realText(prev.content), realText(user.content)) || EMPTY_TEXT
+      const images = [...((prev.images as KiroImage[]) ?? []), ...((user.images as KiroImage[]) ?? [])]
+      if (images.length) prev.images = images
+      continue
+    }
+    kept.push(item)
+  }
+
+  const tail: HistoryTail = { text: '', images: [] }
+  const last = asRecord(kept[kept.length - 1]?.userInputMessage)
+  if (last) {
+    kept.pop()
+    tail.text = realText(last.content)
+    tail.images = (last.images as KiroImage[] | undefined) ?? []
+  }
+  history.splice(0, history.length, ...kept)
+  return tail
+}
+
+/** 按 id 去重：同一个 toolUseId 出现两次，Kiro 按配对错误 400 */
+function uniqueById<T extends { toolUseId: string }>(items: T[]): T[] {
+  const seen = new Set<string>()
+  return items.filter((item) => {
+    if (!item.toolUseId) return true
+    if (seen.has(item.toolUseId)) return false
+    seen.add(item.toolUseId)
+    return true
+  })
 }
 
 export interface BuiltPayload {
@@ -614,7 +708,9 @@ export function buildKiroPayload(
     list = merged.slice(0, lastUserIndex + 1)
   }
 
-  const current = list[list.length - 1] ?? emptyMessage('user')
+  const last = list[list.length - 1] ?? emptyMessage('user')
+  // 同一 id 的重复结果只留第一条（结构化字段与文本叙述都按这份来）
+  const current = { ...last, toolResults: uniqueById(last.toolResults) }
   const past = list.slice(0, -1)
 
   const sendModelId = modelId && modelId !== 'auto' ? modelId : undefined
@@ -634,25 +730,46 @@ export function buildKiroPayload(
   }
 
   /*
-   * 当前消息的 toolResults 只有在「回应的正是上一条 assistant 的 toolUses」时
-   * 才作为结构化字段带上，否则 Kiro 会因为配对不上而 400。
-   * 其余历史里的工具轮次一律压成文本。
+   * 结构化的工具配对只保留一对：上一条 assistant 的 toolUses + 当前消息的 toolResults。
+   * Kiro 要求两边的 id 一一对应，否则 400；其余历史里的工具轮次一律压成文本。
+   *
+   * 配对按 id 校正而不是要求完全一致：
+   *  - 同一 id 的重复结果只留第一条；
+   *  - 不属于上一条 assistant 的结果不进结构化字段（仍以文本形式留在当前消息里）；
+   *  - 上一条 assistant 有调用缺了结果（客户端中途取消、并行调用只回了一部分），
+   *    补一条 error 结果，而不是让整轮退化成文本。
+   * 只要有一条结果对得上就保留结构化，模型才能接着这一轮工具调用往下走。
    */
-  const lastAssistant = [...past].reverse().find((m) => m.role === 'assistant')
-  const resultIds = new Set(current.toolResults.map((r) => r.toolUseId).filter(Boolean))
-  const pairedIds = new Set((lastAssistant?.toolUses ?? []).map((t) => t.toolUseId))
-  const keepStructured =
-    !request.toolsDisabled &&
-    resultIds.size > 0 &&
-    resultIds.size === pairedIds.size &&
-    [...resultIds].every((id) => pairedIds.has(id))
+  const lastAssistant = past[past.length - 1]?.role === 'assistant' ? past[past.length - 1] : undefined
+  const pendingUses = request.toolsDisabled
+    ? []
+    : uniqueById((lastAssistant?.toolUses ?? []).filter((t) => t.toolUseId))
+  const pendingIds = new Set(pendingUses.map((t) => t.toolUseId))
+  const answered = uniqueById(current.toolResults.filter((r) => pendingIds.has(r.toolUseId)))
+  const keepStructured = answered.length > 0
+  const structuredResults: NormToolResult[] = keepStructured
+    ? pendingUses.map(
+        (tool) =>
+          answered.find((r) => r.toolUseId === tool.toolUseId) ?? {
+            toolUseId: tool.toolUseId,
+            content: [{ text: 'Tool call was cancelled before it returned a result.' }],
+            status: 'error'
+          }
+      )
+    : []
 
-  const historyToolNames: string[] = []
+  // toolUseId → 工具名，旧轮次的结果文本靠它标明出自哪个工具
+  const toolNames = new Map<string, string>()
+  for (const message of past) {
+    for (const tool of message.toolUses) {
+      if (tool.toolUseId && tool.name) toolNames.set(tool.toolUseId, tool.name)
+    }
+  }
   for (const message of past) {
     if (message.role === 'user') {
       history.push({
         userInputMessage: {
-          content: userContent(message),
+          content: userContent(message, toolNames),
           ...(sendModelId ? { modelId: sendModelId } : {}),
           origin: 'AI_EDITOR',
           ...(message.images.length ? { images: message.images } : {})
@@ -661,16 +778,9 @@ export function buildKiroPayload(
       continue
     }
 
-    const isLastAssistant = message === lastAssistant
-    const toolUses = isLastAssistant && keepStructured ? message.toolUses : []
-    for (const tool of message.toolUses) {
-      if (tool.name) historyToolNames.push(tool.name)
-    }
-    // 不保留结构化 toolUses 时，把调用过程叙述成文本，模型才知道上一轮做了什么
-    const narrated = toolUses.length
-      ? ''
-      : message.toolUses.map((t) => `[Called tool ${t.name}]`).join('\n')
-    const content = [message.text, narrated].filter(Boolean).join('\n') || EMPTY_TEXT
+    const toolUses = message === lastAssistant && keepStructured ? pendingUses : []
+    // 不保留结构化 toolUses 时直接丢弃，不写成文本（工具名已标在对应的结果文本上）
+    const content = stripPollutedToolText(message.text) || EMPTY_TEXT
     history.push({
       assistantResponseMessage: {
         content,
@@ -687,25 +797,27 @@ export function buildKiroPayload(
     })
   }
 
-  // 禁用工具时一个定义都不发：占位定义也是工具，模型看到了就能调
-  const tools = request.toolsDisabled ? [] : buildTools(request.tools, historyToolNames, toolNameMap)
+  const currentExtra = normalizeHistory(history, sendModelId)
+
+  /*
+   * 禁用工具时一个定义都不发：占位定义也是工具，模型看到了就能调。
+   * 只有保留下来的结构化 toolUses 会引用工具名，只需为它们补占位定义；
+   * 已压成文本的旧轮次不引用任何工具，不必把客户端已经撤掉的工具再挂回去。
+   */
+  const referencedNames = keepStructured ? pendingUses.map((t) => t.name).filter(Boolean) : []
+  const tools = request.toolsDisabled ? [] : buildTools(request.tools, referencedNames, toolNameMap)
   const context: Record<string, unknown> = {}
   if (tools.length) context.tools = tools
-  if (keepStructured) {
-    context.toolResults = current.toolResults.map((result) => ({
-      toolUseId: result.toolUseId,
-      content: result.content,
-      status: result.status
-    }))
-  }
+  if (keepStructured) context.toolResults = structuredResults
 
   const userInputMessage: Record<string, unknown> = {
-    content: userContent(current),
+    content: [currentExtra.text, userContent(current, toolNames)].filter(Boolean).join('\n\n'),
     ...(sendModelId ? { modelId: sendModelId } : {}),
     origin: 'AI_EDITOR',
     userInputMessageContext: context
   }
-  if (current.images.length) userInputMessage.images = current.images
+  const currentImages = [...currentExtra.images, ...current.images]
+  if (currentImages.length) userInputMessage.images = currentImages
 
   const payload: Record<string, unknown> = {
     conversationState: {
@@ -790,7 +902,16 @@ function truncateHistory(payload: Record<string, unknown>, maxBytes: number): vo
     history.splice(hasPriming, 2)
     dropped += 2
   }
-  if (dropped) state.history = history
+  if (dropped) {
+    // 在裁剪处留一句说明，模型才知道更早的上下文被省略了，不会把残缺的历史当成完整对话
+    const first = asRecord(history[hasPriming]?.userInputMessage)
+    if (first) {
+      const before = str(first.content)
+      first.content = `${TRUNCATED_NOTE}\n\n${realText(before)}`.trim()
+      bytes += json(first.content) - json(before)
+    }
+    state.history = history
+  }
 
   if (truncated || dropped) {
     log(

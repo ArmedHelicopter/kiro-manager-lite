@@ -189,6 +189,17 @@ function update(patch: Parameters<typeof settingsStore.update>[0]): void {
   void settingsStore.update(patch)
 }
 
+/** 数字类设置：清空或填了非法值时回落默认值 */
+type NumericSettingKey =
+  | 'keyRefreshInterval'
+  | 'usageRefreshInterval'
+  | 'apiKeyUsageRefreshInterval'
+  | 'apiKeyRefreshConcurrency'
+
+function updateNumber(key: NumericSettingKey, value: unknown): void {
+  update({ [key]: Number(value) || DEFAULT_SETTINGS[key] })
+}
+
 async function saveProxy(): Promise<void> {
   await settingsStore.update({ proxyUrl: proxyDraft.value.trim() })
   message.success('代理地址已保存')
@@ -467,7 +478,7 @@ function resetAll(): void {
             addon-after="分钟"
             style="width: 180px"
             :disabled="!settings.autoRefresh"
-            @change="(v: unknown) => update({ keyRefreshInterval: Number(v) || DEFAULT_SETTINGS.keyRefreshInterval })"
+            @change="(v: unknown) => updateNumber('keyRefreshInterval', v)"
           />
           <span class="muted">
             多久检查一次即将过期的密钥
@@ -483,7 +494,7 @@ function resetAll(): void {
             addon-after="分钟"
             style="width: 180px"
             :disabled="!settings.autoRefreshUsage"
-            @change="(v: unknown) => update({ usageRefreshInterval: Number(v) || DEFAULT_SETTINGS.usageRefreshInterval })"
+            @change="(v: unknown) => updateNumber('usageRefreshInterval', v)"
           />
           <span class="muted">
             多久拉取一次积分用量与订阅信息
@@ -534,7 +545,7 @@ function resetAll(): void {
             addon-after="分钟"
             style="width: 180px"
             :disabled="!settings.autoRefreshApiKeyUsage"
-            @change="(v: unknown) => update({ apiKeyUsageRefreshInterval: Number(v) || DEFAULT_SETTINGS.apiKeyUsageRefreshInterval })"
+            @change="(v: unknown) => updateNumber('apiKeyUsageRefreshInterval', v)"
           />
           <span class="muted">
             默认每 5 分钟同步一次
@@ -547,7 +558,7 @@ function resetAll(): void {
             :min="1"
             :max="20"
             style="width: 180px"
-            @change="(v: unknown) => update({ apiKeyRefreshConcurrency: Number(v) || DEFAULT_SETTINGS.apiKeyRefreshConcurrency })"
+            @change="(v: unknown) => updateNumber('apiKeyRefreshConcurrency', v)"
           />
           <span class="muted">每批同时同步的 API Key 数量，并发过高容易被限流</span>
         </a-form-item>

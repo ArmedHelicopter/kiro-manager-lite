@@ -101,7 +101,8 @@ function buildMenu(): Menu {
       icon: icon('copy'),
       enabled: !!snapshot.email,
       click: () => {
-        if (snapshot.email) clipboard.writeText(snapshot.email)
+        // writeText 自 Electron 44 起返回 Promise，失败不该冒成未处理的拒绝
+        if (snapshot.email) void clipboard.writeText(snapshot.email).catch(() => undefined)
       }
     },
     { type: 'separator' },

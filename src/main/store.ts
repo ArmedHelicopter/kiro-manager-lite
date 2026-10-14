@@ -2,7 +2,7 @@
 import Store from 'electron-store'
 import { app } from 'electron'
 import * as path from 'path'
-import { mkdirSync } from 'fs'
+import { copyFileSync, existsSync, mkdirSync } from 'fs'
 import {
   DEFAULT_KEY_GATEWAY_DATA,
   DEFAULT_PRIMARY_COLOR,
@@ -100,8 +100,39 @@ interface Schema {
 
 const EMPTY_DATA: AccountStoreData = { version: 1, accounts: [], activeAccountId: null }
 
+const STORE_NAME = 'kiro-account-lite'
+
+/** 升级到 electron-store 12 前的主库副本文件名（不含扩展名），清除全部数据时一并删除 */
+export const PRE_UPGRADE_STORE_COPY = `${STORE_NAME}.pre-v1038`
+
+/**
+ * 升级到 electron-store 12 之前留一份原文件副本。
+ *
+ * 新版底层（conf 16）能读旧版（conf 8 / conf 10）写的加密文件，升级没问题；
+ * 但它写回时换了密钥派生的 salt，旧版读不回去。用户若把应用退回旧版本，
+ * 旧版会在启动时解密失败。副本只做一次（有了就不再覆盖），
+ * 退回旧版本时把它改回原名即可继续使用。
+ */
+function backupBeforeStoreFormatChange(): void {
+  try {
+    const dir = app.getPath('userData')
+    const source = path.join(dir, `${STORE_NAME}.json`)
+    const target = path.join(dir, `${PRE_UPGRADE_STORE_COPY}.json`)
+    if (existsSync(source) && !existsSync(target)) copyFileSync(source, target)
+  } catch {
+    // 备份失败不影响启动：正常读写用的是原文件，这份副本只在退回旧版本时才需要
+  }
+}
+
+backupBeforeStoreFormatChange()
+
+/*
+ * 不要加 conf 的 cache 选项：开了之后 store.store 返回的是被冻结的对象，
+ * 下面 write() 里的 snapshot[key] = … 会直接抛错。
+ * 这个文件本身就是为了省掉重复解密与解析，缓存由下面的 snapshot 负责。
+ */
 const store = new Store<Schema>({
-  name: 'kiro-account-lite',
+  name: STORE_NAME,
   encryptionKey: 'kiro-account-lite-local-key',
   defaults: {
     accountData: EMPTY_DATA,
@@ -149,7 +180,11 @@ function peek<K extends keyof Schema>(key: K): Readonly<Schema[K]> {
 }
 
 function write<K extends keyof Schema>(key: K, value: Schema[K]): void {
-  store.set(key, value)
+  /*
+   * conf 16 的 set 重载按具体键推导值类型，泛型 K 下这几个重载都匹配不上。
+   * 这里的键值对由上面的 Schema 保证，断言只是绕开重载推导。
+   */
+  ;(store.set as (key: K, value: Schema[K]) => void)(key, value)
   snapshot ??= store.store
   snapshot[key] = JSON.parse(JSON.stringify(value)) as Schema[K]
 }
