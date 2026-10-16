@@ -69,8 +69,8 @@ const api = {
   updateKey: (id: string, note: string) => invoke('keys:update', id, note),
   setKeysNote: (ids: string[], note: string) => invoke('keys:set-note', ids, note),
   setKeyGroups: (groups: unknown) => invoke('keys:set-groups', groups),
-  setKeysGroup: (ids: string[], groupId: string | null) =>
-    invoke('keys:set-group', ids, groupId),
+  setKeysGroup: (ids: string[], groupIds: string[]) => invoke('keys:set-group', ids, groupIds),
+  setKeysTrashed: (ids: string[], trashed: boolean) => invoke('keys:set-trashed', ids, trashed),
   setKeyRegion: (id: string, region: string) => invoke('keys:set-region', id, region),
   deleteKey: (id: string) => invoke('keys:delete', id),
   selectKey: (id: string | null) => invoke('keys:select', id),
@@ -98,6 +98,7 @@ const api = {
 
   // 积分变化日志
   getUsageHistory: (accountId: string) => invoke('usage:history', accountId),
+  getRecentUsage: (subjectIds: string[]) => invoke('usage:recent', subjectIds),
   recordUsagePoint: (accountId: string, usage: unknown) =>
     invoke('usage:record', accountId, usage),
   clearUsageHistory: (accountId: string) => invoke('usage:clear-history', accountId),
@@ -150,6 +151,7 @@ const api = {
   writeClipboard: (text: string) => {
     void invoke('clipboard:write', text)
   },
+  readClipboard: () => invoke('clipboard:read'),
 
   // 设置 / 应用
   getSettings: () => invoke('settings:get'),

@@ -131,17 +131,31 @@ export function log(level: LogLevel, raw: string): void {
   categoryCounts.set(category, (categoryCounts.get(category) ?? 0) + 1)
 
   pending.push(entry)
-  notify?.(stored)
+  scheduleNotify()
+}
+
+/**
+ * 「有新日志」的推送合并成每 NOTIFY_MS 一次。
+ * 原来每写一行就推一次 IPC：批量刷新时渲染层每条 console.info 都要转发回来再推回去，
+ * 一来一回把 IPC 打满。界面那边本来就按 700ms 节流重查，这里合并不影响实时性。
+ */
+const NOTIFY_MS = 250
+let notifyTimer: ReturnType<typeof setTimeout> | null = null
+
+function scheduleNotify(): void {
+  if (!notify || notifyTimer) return
+  notifyTimer = setTimeout(() => {
+    notifyTimer = null
+    notify?.(stored)
+  }, NOTIFY_MS)
 }
 
 // ============ 查询 ============
 
-/** 按时间升序遍历内存缓冲 */
-function forEachChronological(visit: (entry: LogEntry) => void): void {
-  // 未写满时 0..stored-1 就是时间序；写满后从 writeIndex 开始才是最旧的
-  const start = stored < MEMORY_CAPACITY ? 0 : writeIndex
-  for (let i = 0; i < stored; i++) {
-    const entry = buffer[(start + i) % MEMORY_CAPACITY]
+/** 按时间降序（最新在前）遍历内存缓冲 */
+function forEachNewestFirst(visit: (entry: LogEntry) => void): void {
+  for (let i = 1; i <= stored; i++) {
+    const entry = buffer[(writeIndex - i + MEMORY_CAPACITY) % MEMORY_CAPACITY]
     if (entry) visit(entry)
   }
 }
@@ -151,10 +165,15 @@ export function queryLogs(query: LogQuery = {}): LogQueryResult {
   const needle = keyword?.trim().toLowerCase()
   const levelSet = levels && levels.length ? new Set(levels) : null
 
-  // 只保留最新 limit 条：用定长队列边遍历边淘汰，避免先收集全部再切片
+  /*
+   * 从最新往最旧遍历，只收前 limit 条，最后翻成时间升序。
+   * 原来是升序遍历 + 超出就 shift 掉最旧的：每次 shift 都要整体挪动数组，
+   * 命中上万条时就是上千万次元素移动，日志页每次刷新都卡一下。
+   * matched 仍然统计全部命中数（界面上要显示「命中 N 条」）。
+   */
   const hits: LogEntry[] = []
   let matched = 0
-  forEachChronological((entry) => {
+  forEachNewestFirst((entry) => {
     if (levelSet && !levelSet.has(entry.level)) return
     if (category && entry.category !== category) return
     if (since !== undefined && entry.at < since) return
@@ -163,9 +182,9 @@ export function queryLogs(query: LogQuery = {}): LogQueryResult {
       if (!haystack.includes(needle)) return
     }
     matched++
-    hits.push(entry)
-    if (hits.length > limit) hits.shift()
+    if (hits.length < limit) hits.push(entry)
   })
+  hits.reverse()
 
   return {
     entries: hits,

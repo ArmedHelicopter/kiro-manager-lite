@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, h, ref, watch } from 'vue'
+import { computed, h, ref, toRef, watch } from 'vue'
 import { message } from 'ant-design-vue'
 import {
   AppstoreOutlined,
@@ -11,15 +11,24 @@ import {
   EditOutlined,
   EyeInvisibleOutlined,
   EyeOutlined,
+  FileSearchOutlined,
   FilterOutlined,
   InboxOutlined,
   KeyOutlined,
   PlusOutlined,
+  RestOutlined,
+  RollbackOutlined,
   SearchOutlined,
   SyncOutlined,
   UploadOutlined
 } from '@ant-design/icons-vue'
 import AccountCard from '@/components/accounts/AccountCard.vue'
+import CardContextMenu, { type ContextMenuItem } from '@/components/common/CardContextMenu.vue'
+import TrashToggle from '@/components/common/TrashToggle.vue'
+import BatchQueryModal from '@/components/common/BatchQueryModal.vue'
+import BatchQueryTag from '@/components/common/BatchQueryTag.vue'
+import { useRecentUsage } from '@/composables/useRecentUsage'
+import { useCardContextMenu } from '@/composables/useCardContextMenu'
 import AccountFilterPanel from '@/components/accounts/AccountFilterPanel.vue'
 import VirtualGrid from '@/components/common/VirtualGrid.vue'
 import AddAccountModal from '@/components/accounts/AddAccountModal.vue'
@@ -57,6 +66,7 @@ import {
   notifyResult
 } from '@/utils/ui'
 import { shouldSkipAccountUsageRefresh } from '@shared/refreshPolicy'
+import { isTrashed } from '@shared/itemGroups'
 import type { Account, AccountDisplayMode, SwitchAccountResult } from '@shared/types'
 
 const accountsStore = useAccountsStore()
@@ -89,7 +99,14 @@ const batchTargets = computed(() => {
   const selected = new Set(accountsStore.selectedIds)
   const visible = sorted.value.filter((account) => selected.has(account.id))
   const shown = new Set(visible.map((account) => account.id))
-  return [...visible, ...accountsStore.accounts.filter((a) => selected.has(a.id) && !shown.has(a.id))]
+  // 被筛选挡住的勾选项也算，但只取当前所在的一边（正常列表 / 回收站）
+  const side = accountsStore.trashView
+  return [
+    ...visible,
+    ...accountsStore.accounts.filter(
+      (a) => selected.has(a.id) && !shown.has(a.id) && isTrashed(a) === side
+    )
+  ]
 })
 const editTarget = ref<Account | null>(null)
 const detailTarget = ref<Account | null>(null)
@@ -123,7 +140,8 @@ const refreshing = computed(() => keyRefreshing.value || usageRefreshing.value)
 const refreshButtonText = computed(() => {
   if (keyRefreshing.value) return '正在刷新密钥...'
   if (usageRefreshing.value) {
-    const scope = visibleSelectedCount.value ? `${visibleSelectedCount.value}个账户` : ''
+    const count = accountsStore.selectedIds.length
+    const scope = count ? `${count}个账户` : ''
     return `正在刷新${scope}用量/积分...`
   }
   return `刷新密钥/用量/积分${batchScopeSuffix.value}`
@@ -187,11 +205,48 @@ function toggleGroupFilter(id: string): void {
     : [...list, id]
 }
 
+// ============ 批量查询 ============
+const batchQueryOpen = ref(false)
+
+/** 命中 / 未找到的统计，口径见 store 的 batchQuery（只看当前所在的一边，不受其它筛选影响） */
+const batchQueryHits = computed(
+  () => accountsStore.batchQuery ?? { hits: 0, missing: [] as string[] }
+)
+
+function applyBatchQuery(values: string[]): void {
+  accountsStore.filter.queries = values
+  batchQueryOpen.value = false
+  const { hits, missing } = batchQueryHits.value
+  const text = `批量查询 ${values.length} 个关键字：${hits} 个有结果${missing.length ? `，${missing.length} 个未找到` : ''}`
+  missing.length ? message.warning(text) : message.success(text)
+}
+
+/**
+ * 右键「设置备注 / 设置分组」只作用于那一个账号，和批量入口共用同一个弹窗。
+ * 有值时弹窗的目标就是它，否则是全部勾选项。
+ */
+const noteTarget = ref<Account | null>(null)
+const groupTarget = ref<Account | null>(null)
+const noteIds = computed(() => (noteTarget.value ? [noteTarget.value.id] : accountsStore.selectedIds))
+const groupPickIds = computed(() =>
+  groupTarget.value ? [groupTarget.value.id] : accountsStore.selectedIds
+)
+
+function closeNote(): void {
+  batchNoteOpen.value = false
+  noteTarget.value = null
+}
+
+function closeGroupPicker(): void {
+  batchGroupOpen.value = false
+  groupTarget.value = null
+}
+
 /** 批量备注：覆盖式改写所选账号的备注，留空即清空 */
 function applyBatchNote(note: string): void {
-  const changed = accountsStore.setNoteForAccounts(accountsStore.selectedIds, note)
+  const changed = accountsStore.setNoteForAccounts(noteIds.value, note)
   message.success(note.trim() ? `已为 ${changed} 个账号设置备注` : `已清空 ${changed} 个账号的备注`)
-  batchNoteOpen.value = false
+  closeNote()
 }
 
 /**
@@ -233,9 +288,21 @@ const gridLayout = computed(() => {
   }
 })
 
+/*
+ * 近半小时 / 近 1 小时积分用量：只在选了这两种排序时向主进程批量取。
+ * 账号数据整组替换即表示有刷新结果写回（用量可能变了），据此重取。
+ */
+const recentUsage = useRecentUsage({
+  sortKey,
+  subjectIds: () => accountsStore.filtered.map((a) => a.id),
+  version: () => accountsStore.accounts
+})
+
 /** 排序取值：重置取剩余天数，Token 取 access token 过期时刻 */
 function accountSortValue(account: Account, field: SortField): number | string | undefined {
   if (field === 'email') return account.email
+  // 没有积分变化记录的账号算缺值，排到最后；有记录但这段时间没消耗的是 0
+  if (field === 'recent30' || field === 'recent60') return recentUsage.valueOf(account.id, field)
   // 没拉到过额度（limit 为 0）的账号三项积分都算缺值，排到最后
   const synced = account.usage.limit > 0
   if (field === 'usage') return synced ? account.usage.percentUsed : undefined
@@ -259,7 +326,8 @@ type GridItem = { kind: 'account'; account: Account } | { kind: 'add' }
 
 const gridItems = computed<GridItem[]>(() => [
   ...sorted.value.map((account) => ({ kind: 'account' as const, account })),
-  { kind: 'add' as const }
+  // 回收站里不提供「添加账号」卡
+  ...(accountsStore.trashView ? [] : [{ kind: 'add' as const }])
 ])
 
 function gridItemKey(item: GridItem): string {
@@ -276,7 +344,9 @@ const gridRef = ref<{ scrollToTop: () => void } | null>(null)
  * 只要 watch 源是每次新建的对象/数组，回调就会被触发，
  * 表现就是滚动中莫名跳回顶部。
  */
-const scrollResetKey = computed(() => JSON.stringify([accountsStore.filter, sortKey.value]))
+const scrollResetKey = computed(() =>
+  JSON.stringify([accountsStore.filter, sortKey.value, accountsStore.trashView])
+)
 
 watch(scrollResetKey, () => gridRef.value?.scrollToTop())
 
@@ -294,10 +364,10 @@ const visibleSelectedCount = computed(() => {
 
 /**
  * 批量刷新按钮的范围后缀：有勾选时只刷勾选的账号，把数量带到按钮上。
- * 取可见勾选数而非全部勾选数，与 batch() 实际会处理的条数对齐。
+ * 取全部勾选数（含被筛选挡住的），与 batch() 实际处理的条数、「批量操作（N个）」一致。
  */
 const batchScopeSuffix = computed(() =>
-  visibleSelectedCount.value ? `（${visibleSelectedCount.value}个）` : ''
+  accountsStore.selectedIds.length ? `（${accountsStore.selectedIds.length}个）` : ''
 )
 
 const allVisibleSelected = computed(
@@ -433,41 +503,148 @@ function clearDeletedAccountUi(ids: string[]): void {
   rowBusy.value = nextBusy
 }
 
-function removeOne(account: Account): void {
+/** 放入 / 移出回收站，统一提示 */
+function moveToTrash(ids: string[], trashed: boolean): void {
+  const result = accountsStore.setTrashed(ids, trashed)
+  if (result.error) return void message.error(result.error)
+  clearDeletedAccountUi(ids)
+  message.success(
+    trashed ? `已将 ${result.changed} 个账号放入回收站` : `已将 ${result.changed} 个账号移出回收站`
+  )
+}
+
+/**
+ * 删除确认：正常列表里多一个「放入回收站」，冷藏起来以后还能移回；
+ * 已经在回收站里的再删就是彻底删除，不再给这个选项。
+ */
+function confirmRemove(ids: string[], title: string, content: string | ReturnType<typeof h>): void {
   const doRemove = async (): Promise<void> => {
-    const result = await accountsStore.removeAccounts([account.id])
+    const result = await accountsStore.removeAccounts(ids)
     if (result.error) return void message.error(result.error)
     if (!result.removed) return void message.warning('账号已不存在')
-    clearDeletedAccountUi([account.id])
-    message.success('已删除')
+    clearDeletedAccountUi(ids)
+    message.success(ids.length === 1 ? '已删除' : `已删除 ${result.removed} 个账号`)
   }
-  if (!settingsStore.settings.confirmBeforeDelete) return void doRemove()
   confirmDelete({
-    title: '删除账号',
-    content: h('span', {}, [`确认删除 ${displayEmail(account.email)}？该操作不可撤销。`]),
-    onOk: doRemove
+    title,
+    content,
+    onOk: doRemove,
+    onTrash: accountsStore.trashView ? undefined : () => moveToTrash(ids, true)
   })
+}
+
+function removeOne(account: Account): void {
+  const inTrash = accountsStore.trashView
+  // 关了删除确认时照旧直接删；放入回收站要走确认框里的按钮或右键菜单
+  if (!settingsStore.settings.confirmBeforeDelete) {
+    void accountsStore.removeAccounts([account.id]).then((result) => {
+      if (result.error) return void message.error(result.error)
+      clearDeletedAccountUi([account.id])
+      message.success('已删除')
+    })
+    return
+  }
+  confirmRemove(
+    [account.id],
+    inTrash ? '彻底删除账号' : '删除账号',
+    h('span', {}, [
+      inTrash
+        ? `确认彻底删除 ${displayEmail(account.email)}？删除后无法恢复。`
+        : `确认删除 ${displayEmail(account.email)}？该操作不可撤销；也可以先放入回收站。`
+    ])
+  )
 }
 
 function removeSelected(): void {
   const ids = [...accountsStore.selectedIds]
   if (ids.length === 0) return void message.info('请先选择账号')
-  confirmDelete({
-    title: `删除 ${ids.length} 个账号`,
-    content: '删除后无法恢复，建议先导出备份。',
-    onOk: async () => {
-      const result = await accountsStore.removeAccounts(ids)
-      if (result.error) return void message.error(result.error)
-      clearDeletedAccountUi(ids)
-      message.success(`已删除 ${result.removed} 个账号`)
-    }
-  })
+  const inTrash = accountsStore.trashView
+  confirmRemove(
+    ids,
+    inTrash ? `彻底删除 ${ids.length} 个账号` : `删除 ${ids.length} 个账号`,
+    inTrash ? '删除后无法恢复，建议先导出备份。' : '删除后无法恢复，建议先导出备份；也可以先放入回收站。'
+  )
+}
+
+// ============ 回收站 ============
+
+/** 进出回收站时清空勾选：两边条目互不可见，勾选状态跨视图没有意义 */
+function toggleTrashView(): void {
+  accountsStore.trashView = !accountsStore.trashView
+  accountsStore.selectedIds = []
+}
+
+// ============ 右键菜单 ============
+
+const normalMenu: ContextMenuItem[] = [
+  { key: 'note', label: '设置备注', icon: EditOutlined },
+  { key: 'group', label: '设置分组', icon: AppstoreOutlined },
+  { key: 'apikey', label: '生成 API Key', icon: KeyOutlined },
+  { key: 'subscription', label: '获取订阅链接', icon: CrownOutlined },
+  { key: 'trash', label: '放入回收站', icon: RestOutlined, divided: true },
+  { key: 'remove', label: '删除该账号', icon: DeleteOutlined, danger: true }
+]
+
+const trashMenu: ContextMenuItem[] = [
+  { key: 'restore', label: '移出回收站', icon: RollbackOutlined },
+  { key: 'remove', label: '彻底删除', icon: DeleteOutlined, danger: true, divided: true }
+]
+
+/** 整页只有一个右键菜单实例；作用目标与高亮规则见 useCardContextMenu */
+const contextMenu = useCardContextMenu<Account>({ selectedIds: toRef(accountsStore, 'selectedIds') })
+const menuTargetIds = contextMenu.targetIds
+const contextIds = contextMenu.highlight
+
+/**
+ * 卡片上「打开某个弹窗」类事件的稳定处理器。
+ * 模板里写 `@detail="detailTarget = item.account"` 会在每次渲染生成新的箭头函数，
+ * 虚拟滚动里每张可见卡片都因此被判定 props 变化而整卡重新 patch；
+ * 换成这里固定的函数引用后，只有数据真正变了的卡片才会更新。
+ */
+const cardHandlers = {
+  detail: (account: Account) => (detailTarget.value = account),
+  createApiKey: (account: Account) => (apiKeyTarget.value = account),
+  subscription: (account: Account) => (subscriptionTarget.value = account),
+  edit: (account: Account) => (editTarget.value = account),
+  test: (account: Account) => (testTarget.value = account),
+  usage: (account: Account) => (usageTarget.value = account)
+}
+
+/** 作用于多项时，菜单文案带上数量 */
+const contextMenuItems = computed<ContextMenuItem[]>(() => {
+  const base = accountsStore.trashView ? trashMenu : normalMenu
+  const count = menuTargetIds.value.length
+  if (count <= 1) return base
+  return base.map((item) => ({
+    ...item,
+    label: item.key === 'remove' ? `${accountsStore.trashView ? '彻底删除' : '删除'}所选账号（${count}个）` : `${item.label}（${count}个）`
+  }))
+})
+
+function onContextMenu(key: string): void {
+  const account = contextMenu.target.value
+  if (!account) return
+  const ids = menuTargetIds.value.length ? menuTargetIds.value : [account.id]
+  // 多项时勾选集合就是这批目标（见 useCardContextMenu），直接复用各个批量入口
+  const multi = ids.length > 1
+  if (key === 'note') multi ? (batchNoteOpen.value = true) : (noteTarget.value = account)
+  else if (key === 'group') multi ? (batchGroupOpen.value = true) : (groupTarget.value = account)
+  else if (key === 'apikey') multi ? (batchApiKeyOpen.value = true) : (apiKeyTarget.value = account)
+  else if (key === 'subscription') {
+    multi ? (batchSubscriptionOpen.value = true) : (subscriptionTarget.value = account)
+  } else if (key === 'trash') moveToTrash([...ids], true)
+  else if (key === 'restore') moveToTrash([...ids], false)
+  else if (key === 'remove') multi ? removeSelected() : removeOne(account)
 }
 
 async function batch(kind: 'refresh' | 'check'): Promise<void> {
-  // 按界面当前排序取 id，保证从列表第一个账号开始刷，而不是按内部存储顺序
+  /*
+   * 有勾选时刷全部勾选项，包括被当前筛选挡住、看不见的那些——
+   * 与「批量操作（N个）」的口径一致。顺序按界面当前排序，看不见的排在后面。
+   * 没有勾选时刷当前列表里的全部。
+   */
   const selected = new Set(accountsStore.selectedIds)
-  const scope = selected.size ? sorted.value.filter((a) => selected.has(a.id)) : sorted.value
+  const scope = selected.size ? batchTargets.value : sorted.value
 
   // 没有勾选时才算「刷了全部」，这种情况刷完把自动刷新整轮往后顺延
   const isFullRun = selected.size === 0
@@ -540,6 +717,15 @@ function logoutIde(account: Account): void {
     <div class="accounts-header">
       <!-- 第一行：搜索 + 主操作 -->
       <div class="toolbar">
+        <a-tooltip title="批量查询">
+          <a-button
+            :type="accountsStore.filter.queries.length ? 'primary' : 'default'"
+            aria-label="批量查询"
+            @click="batchQueryOpen = true"
+          >
+            <template #icon><FileSearchOutlined /></template>
+          </a-button>
+        </a-tooltip>
         <a-input
           v-model:value="accountsStore.filter.search"
           allow-clear
@@ -548,6 +734,14 @@ function logoutIde(account: Account): void {
         >
           <template #prefix><SearchOutlined /></template>
         </a-input>
+        <BatchQueryTag
+          v-if="accountsStore.filter.queries.length"
+          :total="accountsStore.filter.queries.length"
+          :hits="batchQueryHits.hits"
+          :missing="batchQueryHits.missing"
+          @edit="batchQueryOpen = true"
+          @clear="accountsStore.filter.queries = []"
+        />
 
         <span class="toolbar-spacer" />
 
@@ -686,9 +880,25 @@ function logoutIde(account: Account): void {
 
         <!-- 展示形态：卡片 / 紧凑卡片 / 列表，选择会持久化 -->
         <DisplayModeSelect :value="displayMode" :size="toolbarSize" @change="setDisplayMode" />
+        <TrashToggle
+          :active="accountsStore.trashView"
+          :count="accountsStore.trashedCount"
+          :size="toolbarSize"
+          @toggle="toggleTrashView"
+        />
+
+        <!-- 回收站里只有「移出回收站 / 彻底删除」两种批量动作 -->
+        <a-button
+          v-if="accountsStore.trashView && accountsStore.selectedIds.length"
+          :size="toolbarSize"
+          @click="moveToTrash([...accountsStore.selectedIds], false)"
+        >
+          <template #icon><RollbackOutlined /></template>
+          移出回收站（{{ accountsStore.selectedIds.length }}个）
+        </a-button>
 
         <!-- 批量操作与删除都作用于全部勾选项（不受当前搜索影响） -->
-        <a-dropdown v-if="accountsStore.selectedIds.length">
+        <a-dropdown v-if="!accountsStore.trashView && accountsStore.selectedIds.length">
           <a-button :size="toolbarSize">
             批量操作（{{ accountsStore.selectedIds.length }}个）
             <DownOutlined />
@@ -722,7 +932,7 @@ function logoutIde(account: Account): void {
           @click="removeSelected"
         >
           <template #icon><DeleteOutlined /></template>
-          删除（{{ accountsStore.selectedIds.length }}个）
+          {{ accountsStore.trashView ? '彻底删除' : '删除' }}（{{ accountsStore.selectedIds.length }}个）
         </a-button>
 
         <a-divider type="vertical" style="margin: 0 2px" />
@@ -755,6 +965,14 @@ function logoutIde(account: Account): void {
       </a-empty>
     </div>
 
+    <div v-else-if="accountsStore.trashView && !sorted.length" class="grid-placeholder">
+      <a-empty
+        :description="accountsStore.trashedCount ? '回收站里没有符合条件的账号' : '回收站是空的'"
+      >
+        <a-button @click="toggleTrashView">返回账号列表</a-button>
+      </a-empty>
+    </div>
+
     <!-- 全量渲染交给虚拟滚动，上千个账号也只保留视口内的 DOM -->
     <!--
       key 绑定展示形态：切换形态时行高相差很大，而虚拟滚动量到的高度只允许变高，
@@ -776,22 +994,24 @@ function logoutIde(account: Account): void {
           v-if="item.kind === 'account'"
           :account="item.account"
           :selected="selectedIdSet.has(item.account.id)"
+          :context-active="contextIds.has(item.account.id)"
           :busy-action="rowBusy[item.account.id]"
           :mode="displayMode"
-          @toggle-select="(checked) => toggleSelect(item.account.id, checked)"
-          @detail="detailTarget = item.account"
-          @create-api-key="apiKeyTarget = item.account"
-          @portal="openPortal(item.account)"
-          @subscription="subscriptionTarget = item.account"
-          @edit="editTarget = item.account"
-          @remove="removeOne(item.account)"
-          @switch="switchTo(item.account)"
-          @logout="logoutIde(item.account)"
-          @refresh-key="refreshKey(item.account)"
-          @refresh-usage="refreshUsage(item.account)"
-          @copy-token="copyToken(item.account)"
-          @test="testTarget = item.account"
-          @usage="usageTarget = item.account"
+          @toggle-select="toggleSelect"
+          @detail="cardHandlers.detail"
+          @create-api-key="cardHandlers.createApiKey"
+          @portal="openPortal"
+          @subscription="cardHandlers.subscription"
+          @edit="cardHandlers.edit"
+          @remove="removeOne"
+          @switch="switchTo"
+          @logout="logoutIde"
+          @refresh-key="refreshKey"
+          @refresh-usage="refreshUsage"
+          @copy-token="copyToken"
+          @test="cardHandlers.test"
+          @usage="cardHandlers.usage"
+          @contextmenu="contextMenu.show"
         />
         <button
           v-else
@@ -806,7 +1026,10 @@ function logoutIde(account: Account): void {
       </template>
     </VirtualGrid>
 
-    <div v-if="!sorted.length && accountsStore.accounts.length" class="no-match muted">
+    <div
+      v-if="!accountsStore.trashView && !sorted.length && accountsStore.accounts.length"
+      class="no-match muted"
+    >
       没有匹配筛选条件的账号
     </div>
 
@@ -819,13 +1042,30 @@ function logoutIde(account: Account): void {
       v-model:open="exportOpen"
       :selected-ids="accountsStore.selectedIds"
     />
+    <CardContextMenu
+      :open="contextMenu.state.open"
+      :x="contextMenu.state.x"
+      :y="contextMenu.state.y"
+      :items="contextMenuItems"
+      @select="onContextMenu"
+      @close="contextMenu.hide"
+    />
     <EditAccountModal v-if="editTarget" :account="editTarget" @close="editTarget = null" />
+    <BatchQueryModal
+      v-if="batchQueryOpen"
+      fields="邮箱、昵称、备注"
+      :initial="accountsStore.filter.queries"
+      placeholder="a@gmail.com&#10;@outlook.com&#10;备注里的关键字"
+      @submit="applyBatchQuery"
+      @close="batchQueryOpen = false"
+    />
     <BatchNoteModal
-      v-if="batchNoteOpen"
-      :ids="accountsStore.selectedIds"
+      v-if="batchNoteOpen || noteTarget"
+      :ids="noteIds"
+      :initial="noteTarget?.note"
       entity="账号"
       @submit="applyBatchNote"
-      @close="batchNoteOpen = false"
+      @close="closeNote"
     />
     <BatchCreateApiKeyModal
       v-if="batchApiKeyOpen"
@@ -838,11 +1078,12 @@ function logoutIde(account: Account): void {
       @close="batchSubscriptionOpen = false"
     />
     <GroupPickerModal
-      v-if="batchGroupOpen"
+      v-if="batchGroupOpen || groupTarget"
       :api="groupApi"
-      :ids="accountsStore.selectedIds"
+      :ids="groupPickIds"
       entity="账号"
-      @close="batchGroupOpen = false"
+      title-entity="账户"
+      @close="closeGroupPicker"
       @manage="groupManageOpen = true"
     />
     <GroupManageModal

@@ -4,6 +4,7 @@
 // 否则客户端会收到两段拼在一起的回复，或者一串索引错乱的 SSE 块。
 // 所以调用方传进来的 canRetry() 必须如实反映「有没有 flush 过」。
 import { errorMessage } from '../shared/errors'
+import { groupIdsOf, isTrashed, type Groupable, type Trashable } from '../shared/itemGroups'
 import { jsonOf, takeFrames } from './eventStream'
 import {
   apiKeyChatEndpoint,
@@ -19,7 +20,15 @@ import { httpStream } from './net'
 import { log } from './logger'
 import { refreshAccountToken } from './accountService'
 import { sleep } from './utils'
-import { getAccountData, getKeyData, getProxyModels, setAccountData, setProxyModels, viewAccountData } from './store'
+import {
+  getAccountData,
+  getKeyData,
+  getProxyModels,
+  setAccountData,
+  setProxyModels,
+  viewAccountData,
+  viewKeyData
+} from './store'
 import type {
   Account,
   KeyEntry,
@@ -141,19 +150,22 @@ export function poolOptionsFrom(config: ProxyConfig): AccountPoolOptions {
 const cursors: Record<ProxyAccountSource, number> = { account: 0, apiKey: 0 }
 
 /** 按策略圈定范围；group / selected 没选任何东西时范围为空，由调用方报「请先选择」 */
-function inScope<T extends { id: string; groupId?: string }>(
+function inScope<T extends { id: string } & Groupable & Trashable>(
   items: T[],
   options: AccountPoolOptions
 ): T[] {
+  // 回收站里的是冷藏条目：任何策略下都不参与选号，指定了也不用
+  const live = items.filter((item) => !isTrashed(item))
   if (options.mode === 'group') {
+    // 多分组：属于所选任一分组即可
     const groups = new Set(options.groupIds)
-    return items.filter((item) => !!item.groupId && groups.has(item.groupId))
+    return live.filter((item) => groupIdsOf(item).some((id) => groups.has(id)))
   }
   if (options.mode === 'selected') {
     const ids = new Set(options.ids)
-    return items.filter((item) => ids.has(item.id))
+    return live.filter((item) => ids.has(item.id))
   }
-  return items
+  return live
 }
 
 /**
@@ -184,7 +196,10 @@ function keyLabel(key: KeyEntry): string {
  */
 export function poolMembers(options: AccountPoolOptions): PoolMember[] {
   if (options.source === 'apiKey') {
-    const keys = inScope(getKeyData().keys, options).filter((key) => key.key.startsWith('ksk_'))
+    // 只读视图：选号只筛选、不改 Key，省掉每个请求一次整表深拷贝
+    const keys = inScope(viewKeyData().keys as KeyEntry[], options).filter((key) =>
+      key.key.startsWith('ksk_')
+    )
     return preferWithQuota(
       keys,
       (key) => key.usedCredits ?? 0,

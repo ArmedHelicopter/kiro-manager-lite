@@ -39,6 +39,7 @@ import {
   PAYLOAD_LIMIT_MIN_KB
 } from '@shared/types'
 import { FALLBACK_MODEL_IDS } from '@shared/proxyModels'
+import { groupIdsOf, type Groupable } from '@shared/itemGroups'
 import type {
   ProxyClientTarget,
   ProxyConfig,
@@ -75,7 +76,8 @@ function toggleRisk(): void {
 
 /** 账号下拉：打码跟随全局隐私开关 */
 const accountOptions = computed(() =>
-  accountsStore.accounts.map((account) => ({
+  // 回收站里的账号不会被选用，下拉里也不列
+  accountsStore.liveAccounts.map((account) => ({
     value: account.id,
     label: `${displayEmail(account.email, privacy.value)}${account.nickname ? ` · ${account.nickname}` : ''}`,
     disabled: account.status === 'banned'
@@ -169,7 +171,7 @@ function keyOptionLabel(entry: { key: string; note?: string; email?: string }): 
 /** 指定账号 / 指定 Key 的候选 */
 const memberOptions = computed(() =>
   config.value.accountSource === 'apiKey'
-    ? keysStore.data.keys.map((entry) => ({ value: entry.id, label: keyOptionLabel(entry) }))
+    ? keysStore.liveKeys.map((entry) => ({ value: entry.id, label: keyOptionLabel(entry) }))
     : accountOptions.value
 )
 
@@ -249,10 +251,11 @@ function memberPatch(ids: string[]): Partial<ProxyConfig> {
  */
 const scopeIds = computed<string[]>(() => {
   const apiKey = config.value.accountSource === 'apiKey'
-  const items: { id: string; groupId?: string }[] = apiKey ? keysStore.data.keys : accountsStore.accounts
+  // 回收站里的账号 / Key 反代不会选用，这里同样排除，数字才和实际可用范围一致
+  const items = (apiKey ? keysStore.liveKeys : accountsStore.liveAccounts) as ({ id: string } & Groupable)[]
   if (config.value.accountMode === 'group') {
     const groups = new Set(selectedGroupIds.value)
-    return items.filter((item) => !!item.groupId && groups.has(item.groupId)).map((item) => item.id)
+    return items.filter((item) => groupIdsOf(item).some((id) => groups.has(id))).map((item) => item.id)
   }
   if (config.value.accountMode === 'selected') {
     const ids = new Set(selectedMemberIds.value)

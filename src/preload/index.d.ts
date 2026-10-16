@@ -100,8 +100,10 @@ export interface Api {
   setKeysNote: (ids: string[], note: string) => Promise<IpcResult<KeyGatewayData>>
   /** 整表替换分组定义（新建 / 改名 / 删除 / 排序共用），顺带清掉悬空的 groupId */
   setKeyGroups: (groups: AccountGroup[]) => Promise<IpcResult<KeyGatewayData>>
-  /** 批量设置分组，groupId 传 null 表示移出分组 */
-  setKeysGroup: (ids: string[], groupId: string | null) => Promise<IpcResult<KeyGatewayData>>
+  /** 批量设置分组：整体替换为 groupIds，空数组表示移出全部分组 */
+  setKeysGroup: (ids: string[], groupIds: string[]) => Promise<IpcResult<KeyGatewayData>>
+  /** 放入 / 移出回收站 */
+  setKeysTrashed: (ids: string[], trashed: boolean) => Promise<IpcResult<KeyGatewayData>>
   /** 修改单个 Key 的区域 */
   setKeyRegion: (
     id: string,
@@ -176,6 +178,10 @@ export interface Api {
   logoutKiro: () => Promise<IpcResult<{ deleted: number }>>
 
   getUsageHistory: (accountId: string) => Promise<IpcResult<UsageHistoryEntry[]>>
+  /** 最近半小时 / 一小时实际消耗的积分；API Key 的 id 要带 key: 前缀 */
+  getRecentUsage: (
+    subjectIds: string[]
+  ) => Promise<IpcResult<Record<string, { m30: number; m60: number }>>>
   recordUsagePoint: (
     accountId: string,
     usage: AccountUsage
@@ -236,6 +242,7 @@ export interface Api {
     filename: string
   ) => Promise<IpcResult<{ saved: boolean; path?: string; count?: number }>>
   writeClipboard: (text: string) => void
+  readClipboard: () => Promise<IpcResult<string>>
 
   getSettings: () => Promise<IpcResult<AppSettings>>
   saveSettings: (patch: Partial<AppSettings>) => Promise<IpcResult<AppSettings>>

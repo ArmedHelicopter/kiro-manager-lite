@@ -1,5 +1,6 @@
 // 导入 / 导出格式转换
 import { DEFAULT_REGION } from '@shared/regions'
+import { groupIdsOf } from '@shared/itemGroups'
 import type {
   Account,
   AccountExportData,
@@ -228,7 +229,7 @@ export function buildExportContent(
   switch (format) {
     case 'json': {
       // 只带上这批账号真正用到的分组，避免把无关分组塞进别人的备份
-      const referenced = new Set(accounts.map((a) => a.groupId).filter(Boolean) as string[])
+      const referenced = new Set(accounts.flatMap((a) => groupIdsOf(a)))
       const usedGroups = (groups ?? []).filter((g) => referenced.has(g.id))
       const data: AccountExportData = {
         app: 'kiro-account-lite',

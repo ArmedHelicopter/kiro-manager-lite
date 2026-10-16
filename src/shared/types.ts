@@ -146,8 +146,15 @@ export interface Account {
   nickname?: string
   note?: string
   idp: IdpType
-  /** 所属分组 id；分组被删除后这里会被清空，界面按「未分组」处理 */
+  /**
+   * 旧版的单分组字段。新版写入时镜像为 groupIds 的第一个，供退回旧版本时保住至少一个分组。
+   * 读写一律经 shared/itemGroups 的 groupIdsOf / withGroupIds，不要直接用。
+   */
   groupId?: string
+  /** 所属的全部分组 id；分组被删除后残留的 id 由界面按「未分组」处理 */
+  groupIds?: string[]
+  /** 放入回收站的时间；存在即表示在回收站里，不参与列表、搜索、自动刷新与反代选号 */
+  trashedAt?: number
   userId?: string
   profileArn?: string
   credentials: AccountCredentials
@@ -1392,8 +1399,15 @@ export interface KeyEntry {
   /** 完整密钥，ksk_ 开头 */
   key: string
   note?: string
-  /** 所属分组 id，未分组时不存该字段；分组被删除时由主进程清掉 */
+  /**
+   * 旧版的单分组字段，新版写入时镜像为 groupIds 的第一个（兼容回退）。
+   * 读写一律经 shared/itemGroups，不要直接用。
+   */
   groupId?: string
+  /** 所属的全部分组 id；分组被删除时由主进程清掉对应项 */
+  groupIds?: string[]
+  /** 放入回收站的时间；存在即表示在回收站里，不参与列表、搜索、自动刷新与反代选号 */
+  trashedAt?: number
   /**
    * 该 Key 所属 AWS 区域。不同 Key 可能来自不同区域，
    * 查询额度与网关转发都按各自的区域走。旧数据由 store 迁移时补齐。

@@ -2,7 +2,7 @@ import { app, dialog, ipcMain, nativeImage, screen, shell, BrowserWindow } from 
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { applyRuntimeSettings, registerIpc } from './ipc'
-import { getSettings } from './store'
+import { flushStore, getSettings } from './store'
 import { normalizePortalLocale } from '../shared/portalLocale'
 import { closePortalWindow } from './kiroPortal'
 import {
@@ -312,5 +312,7 @@ app.on('will-quit', () => {
   // 内置浏览器是 BaseWindow，不受主窗口关闭影响，得显式收掉
   closePortalWindow()
   destroyTray()
+  // 主库的合并写入最后刷：上面几步（还原端点等）可能还会改数据
+  flushStore()
   void shutdownLogger()
 })

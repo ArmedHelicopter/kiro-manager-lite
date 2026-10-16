@@ -87,7 +87,8 @@ const warnings = computed(() => {
   const error: Account[] = []
   const expiring: Account[] = []
   const quotaHigh: Account[] = []
-  for (const a of accountsStore.accounts) {
+  // 回收站里的账号是冷藏的，不在主页提醒
+  for (const a of accountsStore.liveAccounts) {
     if (a.status === 'banned') {
       banned.push(a)
       continue
@@ -159,7 +160,8 @@ const usageStats = computed(() => {
   let overQuotaCount = 0
   let validAccountCount = 0
 
-  for (const a of accountsStore.accounts) {
+  // 回收站里的账号是冷藏的，不计入额度统计
+  for (const a of accountsStore.liveAccounts) {
     if (a.status !== 'active') continue
     const limit = a.usage.limit ?? 0
     if (limit <= 0) continue
@@ -266,9 +268,24 @@ const quotaDetails = computed(() => {
 /** 当前账号显示名，模板里多处复用 */
 const activeName = computed(() => (active.value ? accountName(active.value, privacy.value) : ''))
 
-const recent = computed(() =>
-  [...accountsStore.accounts].sort((a, b) => (b.lastUsedAt || 0) - (a.lastUsedAt || 0)).slice(0, 5)
-)
+/**
+ * 最近使用的 5 个账号。只要前 5 个，没必要把上千个账号整表复制再排序：
+ * 一次遍历维护一个长度不超过 5 的有序小数组，效果相同。
+ */
+const RECENT_COUNT = 5
+const recent = computed(() => {
+  const top: Account[] = []
+  const lastUsed = (a: Account): number => a.lastUsedAt || 0
+  for (const account of accountsStore.liveAccounts) {
+    if (top.length === RECENT_COUNT && lastUsed(account) <= lastUsed(top[RECENT_COUNT - 1])) continue
+    // 插到第一个比它旧的位置前面；相等时排在已有的后面，和稳定排序的结果一致
+    let i = top.length
+    while (i > 0 && lastUsed(top[i - 1]) < lastUsed(account)) i--
+    top.splice(i, 0, account)
+    if (top.length > RECENT_COUNT) top.pop()
+  }
+  return top
+})
 
 const tips = [
   '点击左侧「账户管理」可以查看和管理所有账号',
@@ -288,8 +305,8 @@ function displayName(account: Account): string {
 }
 
 function jumpToAccounts(patch: Partial<AccountFilter>): void {
-  // 从首页点过去是「给我看这批账号」，遗留的分组筛选会把结果挡掉，一并清空
-  accountsStore.applyFilter({ groupIds: [], ...patch })
+  // 从首页点过去是「给我看这批账号」，遗留的分组筛选与批量查询会把结果挡掉，一并清空
+  accountsStore.applyFilter({ groupIds: [], queries: [], ...patch })
   void router.push({ name: 'accounts' })
 }
 

@@ -35,7 +35,8 @@ export const useProxyStore = defineStore('proxy', () => {
   })
   // 流式期间每 150ms 整组替换一次，从不就地修改，用 shallowRef 省掉逐条建代理
   const logs = shallowRef<ProxyLogEntry[]>([])
-  const usage = ref<ProxyAccountUsage[]>([])
+  // 只整体替换，用浅层响应式
+  const usage = shallowRef<ProxyAccountUsage[]>([])
   const clients = ref<ProxyClientState[]>([])
   /** 从账号拉回的模型列表；null 表示还没拉过 */
   const models = ref<ProxyModelCache | null>(null)

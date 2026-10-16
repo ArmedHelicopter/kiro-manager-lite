@@ -8,6 +8,7 @@
 import { useAccountsStore } from '@/stores/accounts'
 import { useKeysStore } from '@/stores/keys'
 import type { AccountGroup } from '@shared/types'
+import { validGroupIdsOf } from '@shared/itemGroups'
 
 export interface GroupApi {
   /** 分组列表，已按 order 排好 */
@@ -21,10 +22,12 @@ export interface GroupApi {
   remove: (id: string) => Promise<string | null>
   reorder: (orderedIds: string[]) => Promise<string | null>
   /**
-   * 批量设置分组，返回实际变化的条数。
-   * groupId 传 null 表示移出分组（把条目变回未分组）。
+   * 批量设置分组（可多个），返回实际变化的条数。
+   * 传空数组表示移出全部分组（把条目变回未分组）。
    */
-  assign: (ids: string[], groupId: string | null) => Promise<{ error?: string; changed: number }>
+  assign: (ids: string[], groupIds: string[]) => Promise<{ error?: string; changed: number }>
+  /** 条目当前所属的有效分组 id，单个条目设置分组时用来预选 */
+  groupsOf: (id: string) => string[]
 }
 
 /** 账号侧：store 里是同步方法，这里包成 async 以对齐接口 */
@@ -55,8 +58,12 @@ export function accountGroupApi(): GroupApi {
       store.reorderGroups(orderedIds)
       return null
     },
-    async assign(ids, groupId) {
-      return { changed: store.setGroupForAccounts(ids, groupId) }
+    async assign(ids, groupIds) {
+      return { changed: store.setGroupForAccounts(ids, groupIds) }
+    },
+    groupsOf(id) {
+      const account = store.accounts.find((a) => a.id === id)
+      return account ? validGroupIdsOf(account, (g) => store.groupMap.has(g)) : []
     }
   }
 }
@@ -80,9 +87,13 @@ export function keyGroupApi(): GroupApi {
     rename: (id, name) => store.renameGroup(id, name),
     remove: (id) => store.removeGroup(id),
     reorder: (orderedIds) => store.reorderGroups(orderedIds),
-    async assign(ids, groupId) {
-      const res = await store.setGroupForKeys(ids, groupId)
+    async assign(ids, groupIds) {
+      const res = await store.setGroupForKeys(ids, groupIds)
       return res.error ? { error: res.error, changed: 0 } : { changed: res.changed ?? 0 }
+    },
+    groupsOf(id) {
+      const entry = store.data.keys.find((k) => k.id === id)
+      return entry ? validGroupIdsOf(entry, (g) => store.groupMap.has(g)) : []
     }
   }
 }

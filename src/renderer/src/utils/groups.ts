@@ -1,5 +1,6 @@
 // 分组相关的公用小工具：账号列表与 API Key 列表共用同一套分组语义
 import type { AccountGroup } from '@shared/types'
+import { groupIdsOf, isTrashed, type Groupable, type Trashable } from '@shared/itemGroups'
 
 /**
  * 筛选里代表「未分组」的哨兵值。
@@ -15,19 +16,52 @@ export function sortGroups(groups: AccountGroup[] | undefined): AccountGroup[] {
 
 /**
  * 统计各分组下的条目数，外加「未分组」一项，用于面板上的计数。
- * 分组已被删除的条目一律计入未分组，避免残留 id 让计数对不上。
+ * 一个条目属于多个分组时，每个分组各计一次；
+ * 分组都已被删除的条目计入未分组，避免残留 id 让计数对不上。
+ * 回收站里的条目不计入（它们不出现在正常列表里）。
  */
-export function countByGroup<T extends { groupId?: string }>(
+export function countByGroup<T extends Groupable & Trashable>(
   items: T[],
   groups: AccountGroup[]
 ): Record<string, number> {
   const counts: Record<string, number> = { [UNGROUPED]: 0 }
   for (const group of groups) counts[group.id] = 0
   for (const item of items) {
-    const key = item.groupId && counts[item.groupId] !== undefined ? item.groupId : UNGROUPED
-    counts[key]++
+    if (isTrashed(item)) continue
+    let matched = false
+    for (const id of groupIdsOf(item)) {
+      if (counts[id] === undefined) continue
+      counts[id]++
+      matched = true
+    }
+    if (!matched) counts[UNGROUPED]++
   }
   return counts
+}
+
+/**
+ * 分组筛选：所选分组里命中任一即可；UNGROUPED 表示「没有任何有效分组」。
+ * exists 判断分组是否还存在，被删分组的残留 id 按不存在处理。
+ */
+export function matchesGroupFilter(
+  item: Groupable,
+  selected: ReadonlySet<string>,
+  exists: (id: string) => boolean
+): boolean {
+  // 筛选对每个条目都要跑一遍，直接遍历、不分配中间数组
+  let hasValid = false
+  for (const id of groupIdsOf(item)) {
+    if (!exists(id)) continue
+    if (selected.has(id)) return true
+    hasValid = true
+  }
+  return !hasValid && selected.has(UNGROUPED)
+}
+
+/** 条目的有效分组（按分组顺序），供卡片展示多个分组标签 */
+export function groupsOfItem(item: Groupable, groups: AccountGroup[]): AccountGroup[] {
+  const ids = new Set(groupIdsOf(item))
+  return groups.filter((group) => ids.has(group.id))
 }
 
 /** 按给定顺序重排，order 重新按下标写死；漏掉的按原顺序补在后面 */

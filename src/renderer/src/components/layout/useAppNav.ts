@@ -42,7 +42,8 @@ export function useAppNav() {
   }
 
   const items = computed<NavItem[]>(() => {
-    const accountCount = accountsStore.stats.total
+    // 侧栏只数正常列表里的账号，不随「正在看回收站」变化
+    const accountCount = accountsStore.liveAccounts.length
     return [
       { key: 'home', label: '主页', icon: HomeOutlined },
       {

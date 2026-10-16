@@ -3,27 +3,25 @@ import { computed, h, onMounted, onUnmounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { message, Modal } from 'ant-design-vue'
 import {
-  ApiOutlined,
   AppstoreOutlined,
   CheckCircleFilled,
-  CopyOutlined,
   DeleteOutlined,
   DownOutlined,
   DownloadOutlined,
   EditOutlined,
   ExclamationCircleFilled,
+  FileSearchOutlined,
   EyeInvisibleOutlined,
   EyeOutlined,
-  GlobalOutlined,
   KeyOutlined,
   PlusOutlined,
   PoweroffOutlined,
   ReloadOutlined,
+  RestOutlined,
+  RollbackOutlined,
   SearchOutlined,
   SettingOutlined,
-  CalendarOutlined,
   FilterOutlined,
-  SwapOutlined,
   SyncOutlined,
   ThunderboltOutlined,
   UploadOutlined
@@ -32,20 +30,10 @@ import { useKeysStore } from '@/stores/keys'
 import { useSettingsStore } from '@/stores/settings'
 import { bodyPopupContainer, confirmDelete, confirmUseApiKey } from '@/utils/ui'
 import {
-  displayEmail as maskedEmail,
   displayKey as maskedKey,
   displayNote as maskedNote
 } from '@/utils/display'
-import {
-  KEY_STATUS_META,
-  formatCreditsPair,
-  formatDate,
-  formatDateTime,
-  subscriptionMeta,
-  usageColor
-} from '@/utils/format'
-import { normalizeSubscriptionType } from '@shared/subscription'
-import { keyIssueOf, shouldSkipKeyUsageRefresh } from '@shared/refreshPolicy'
+import { shouldSkipKeyUsageRefresh } from '@shared/refreshPolicy'
 import RegionSelect from '@/components/common/RegionSelect.vue'
 import AddApiKeyModal from '@/components/keys/AddApiKeyModal.vue'
 import ImportApiKeysModal from '@/components/keys/ImportApiKeysModal.vue'
@@ -66,15 +54,30 @@ import { DEFAULT_SORT, SORT_FIELDS, compareBy, type SortField, type SortKey } fr
 import GroupPickerModal from '@/components/common/GroupPickerModal.vue'
 import BatchNoteModal from '@/components/common/BatchNoteModal.vue'
 import DisplayModeSelect from '@/components/common/DisplayModeSelect.vue'
-import { UNGROUPED } from '@/utils/groups'
+import CardContextMenu, { type ContextMenuItem } from '@/components/common/CardContextMenu.vue'
+import TrashToggle from '@/components/common/TrashToggle.vue'
+import BatchQueryModal from '@/components/common/BatchQueryModal.vue'
+import BatchQueryTag from '@/components/common/BatchQueryTag.vue'
+import { useRecentUsage } from '@/composables/useRecentUsage'
+import { useCardContextMenu } from '@/composables/useCardContextMenu'
+import { matchesGroupFilter } from '@/utils/groups'
+import {
+  keyDaysRemaining,
+  keyIssue,
+  keyStatusKey,
+  keyTier,
+  keyUsageRatio as usageRatio
+} from '@/utils/keyEntry'
+import KeyCard from '@/components/keys/KeyCard.vue'
+import { runBatchQuery } from '@/utils/batchQuery'
+import { isTrashed } from '@shared/itemGroups'
 import { keyGroupApi } from '@/utils/groupApi'
-import { DEFAULT_REGION, regionLabel } from '@shared/regions'
+import { DEFAULT_REGION } from '@shared/regions'
 import type {
   AccountDisplayMode,
   KeyEntry,
   KeyFilter,
   KeyGatewayConflict,
-  KeyGatewayUsageStats,
   KeyStatus,
   KiroCapability,
   SubscriptionType
@@ -89,7 +92,6 @@ const settingsStore = useSettingsStore()
  */
 const toolbarSize = computed(() => settingsStore.toolbarSize)
 const { data, status, activeKey, loading } = storeToRefs(store)
-const precision = computed(() => settingsStore.settings.usagePrecision)
 const privacyMode = computed(() => settingsStore.settings.privacyMode)
 const search = ref('')
 
@@ -165,9 +167,75 @@ function toggleGroupFilter(id: string): void {
   filter.value.groupIds = list.includes(id) ? list.filter((v) => v !== id) : [...list, id]
 }
 
-/** 该 Key 所属分组名；分组已被删除时按未分组处理，标签不显示 */
-function groupNameOf(entry: KeyEntry): string {
-  return entry.groupId ? (store.groupMap.get(entry.groupId)?.name ?? '') : ''
+/**
+ * 右键「设置备注 / 设置分组」只作用于那一个 Key，和批量入口共用同一个弹窗。
+ * 设置备注沿用卡片上已有的「修改备注」弹窗。
+ */
+const groupTarget = ref<KeyEntry | null>(null)
+const groupPickIds = computed(() => (groupTarget.value ? [groupTarget.value.id] : selectedIds.value))
+
+function closeGroupPicker(): void {
+  batchGroupOpen.value = false
+  groupTarget.value = null
+}
+
+// ============ 回收站 ============
+/** 是否正在看回收站：打开时列表、搜索、筛选只作用于回收站里的 Key */
+const trashView = ref(false)
+
+// ============ 批量查询 ============
+const batchQueryOpen = ref(false)
+/**
+ * 批量查询的关键字（一行一个，已转小写、去重）；
+ * 按 API Key / 绑定邮箱 / 备注模糊匹配，命中任意一个关键字即显示。
+ */
+const batchQuery = ref<string[]>([])
+
+/** 批量查询用的小写文本按条目对象缓存：Key 条目只会整体替换，同一对象的文本不会变 */
+const queryTexts = new WeakMap<KeyEntry, string>()
+function queryTextOf(entry: KeyEntry): string {
+  let text = queryTexts.get(entry)
+  if (text === undefined) {
+    text = `${entry.key} ${entry.email ?? ''} ${entry.note ?? ''}`.toLowerCase()
+    queryTexts.set(entry, text)
+  }
+  return text
+}
+
+/** 批量查询结果：只在当前所在的一边里查，不受其它筛选影响，「未找到」就是真的不在这里 */
+const batchQueryResult = computed(() => {
+  if (!batchQuery.value.length) return null
+  const side = data.value.keys.filter((entry) => isTrashed(entry) === trashView.value)
+  return runBatchQuery(side, queryTextOf, batchQuery.value)
+})
+
+const batchQueryHits = computed(
+  () => batchQueryResult.value ?? { hits: 0, missing: [] as string[] }
+)
+
+function applyBatchQuery(values: string[]): void {
+  batchQuery.value = values
+  batchQueryOpen.value = false
+  const { hits, missing } = batchQueryHits.value
+  const text = `批量查询 ${values.length} 个关键字：${hits} 个有结果${missing.length ? `，${missing.length} 个未找到` : ''}`
+  missing.length ? message.warning(text) : message.success(text)
+}
+
+function toggleTrashView(): void {
+  trashView.value = !trashView.value
+  // 两边条目互不可见，勾选状态跨视图没有意义
+  selectedIds.value = []
+}
+
+async function moveToTrash(ids: string[], trashed: boolean): Promise<void> {
+  const error = await store.setTrashed(ids, trashed)
+  if (error) return void message.error(error)
+  const moved = new Set(ids)
+  selectedIds.value = selectedIds.value.filter((id) => !moved.has(id))
+  clearDeletedKeyUi(ids)
+  message.success(
+    trashed ? `已将 ${ids.length} 个 API Key 放入回收站` : `已将 ${ids.length} 个 API Key 移出回收站`
+  )
 }
 
 // ============ 展示形态 ============
@@ -225,25 +293,6 @@ function keyItemExtra(entry: KeyEntry): number {
   return keyIssue(entry) ? ERROR_ROW_EXTRA : 0
 }
 
-/**
- * 订阅档位：直接从上游返回的标题算，与账号管理共用同一个判定口径。
- * 不读历史的 tier 字段——那套小写分层没有 Pro Max，存量数据里 Pro Max 记成了 pro+。
- */
-function keyTier(entry: KeyEntry): SubscriptionType {
-  return normalizeSubscriptionType(entry.subscription || '')
-}
-
-function keyStatusKey(entry: KeyEntry): KeyStatus {
-  if (keyIssue(entry)) return 'error'
-  return entry.lastCheckedAt ? 'normal' : 'unchecked'
-}
-
-/** 额度重置剩余天数；上游没给重置时间时返回 undefined（该 Key 不参与天数筛选） */
-function keyDaysRemaining(entry: KeyEntry): number | undefined {
-  if (!entry.nextResetAt) return undefined
-  return Math.max(0, Math.ceil((entry.nextResetAt - Date.now()) / 86_400_000))
-}
-
 /** 筛选面板的命中计数：按全部 Key 统计，不受当前筛选影响 */
 const keyStats = computed(() => {
   const bySubscription: Record<SubscriptionType, number> = {
@@ -256,7 +305,10 @@ const keyStats = computed(() => {
     Student: 0
   }
   const byStatus: Record<KeyStatus, number> = { normal: 0, error: 0, unchecked: 0 }
+  // 只统计当前所在的一边（正常列表或回收站），筛选面板上的数字才和列表对得上
+  const inTrash = trashView.value
   for (const entry of data.value.keys) {
+    if (isTrashed(entry) !== inTrash) continue
     const tier = keyTier(entry)
     bySubscription[tier] = (bySubscription[tier] ?? 0) + 1
     const status = keyStatusKey(entry)
@@ -328,6 +380,20 @@ const restartPromptMessage = computed(() => {
 /** API Key 没有会过期的 Token，排序项里不列 Token 有效期 */
 const sortFields = SORT_FIELDS.filter((item) => item.field !== 'token')
 
+/** Key 在积分变化日志里的 id 带 key: 前缀，与账号区分 */
+const usageSubjectId = (entry: KeyEntry): string => `key:${entry.id}`
+
+/*
+ * 近半小时 / 近 1 小时积分用量：只在选了这两种排序时向主进程批量取。
+ * Key 数据整表替换即表示有同步结果写回（用量可能变了），据此重取。
+ */
+const recentUsage = useRecentUsage({
+  sortKey,
+  subjectIds: () =>
+    data.value.keys.filter((entry) => isTrashed(entry) === trashView.value).map(usageSubjectId),
+  version: () => data.value.keys
+})
+
 const filteredKeys = computed(() => {
   const needle = search.value.trim().toLowerCase()
   const {
@@ -355,6 +421,10 @@ const filteredKeys = computed(() => {
     sortKey.value,
     (entry: KeyEntry, field: SortField) => {
       if (field === 'email') return entry.email
+      // 没有积分变化记录的 Key 算缺值，排到最后；有记录但这段时间没消耗的是 0
+      if (field === 'recent30' || field === 'recent60') {
+        return recentUsage.valueOf(usageSubjectId(entry), field)
+      }
       // 没查到过额度的 Key 三项积分都算缺值，排到最后
       const total = entry.totalCredits
       if (field === 'usage') return total ? ratioOf(entry) : undefined
@@ -366,19 +436,23 @@ const filteredKeys = computed(() => {
     (entry: KeyEntry) => entry.createdAt
   )
   // filter 本身就返回新数组，sort 不会动到 store 里的原数组
+  const inTrash = trashView.value
+  const groupExists = (id: string): boolean => store.groupMap.has(id)
+  const queryMatched = batchQueryResult.value?.matched ?? null
   return data.value.keys
     .filter((entry) => {
+      // 回收站与正常列表互不可见：搜索与筛选都只作用于当前所在的那一边
+      if (isTrashed(entry) !== inTrash) return false
+      // 批量查询：命中任意一个关键字（Key / 邮箱 / 备注模糊匹配）
+      if (queryMatched && !queryMatched.has(entry.id)) return false
       if (needle) {
         const hit =
           (entry.note || '').toLowerCase().includes(needle) ||
           entry.key.toLowerCase().includes(needle)
         if (!hit) return false
       }
-      // 分组已被删除的 Key 一律视为未分组，避免残留 id 让它从列表里消失
-      if (groupSet) {
-        const key = entry.groupId && store.groupMap.has(entry.groupId) ? entry.groupId : UNGROUPED
-        if (!groupSet.has(key)) return false
-      }
+      // 多分组：命中所选任一分组即可；分组都已被删除的 Key 视为未分组
+      if (groupSet && !matchesGroupFilter(entry, groupSet, groupExists)) return false
       if (subscriptions.length && !subscriptions.includes(keyTier(entry))) return false
       if (statuses.length && !statuses.includes(keyStatusKey(entry))) return false
       // 范围条件一律用 != null 判断「是否已设置」：输入框清空后给的是 null，
@@ -423,17 +497,25 @@ function keyItemKey(entry: KeyEntry): string {
 const selectedSet = computed(() => new Set(selectedIds.value))
 const visibleSelectedCount = computed(() => filteredKeys.value.filter((entry) => selectedSet.value.has(entry.id)).length)
 /**
- * 批量操作（刷新、测活）的共同目标：有勾选就只处理勾选的，否则处理当前列表全部。
- * 一律从 filteredKeys 里筛，顺序与界面卡片保持一致，也自然排除被搜索过滤掉的。
+ * 批量操作（刷新、测活）的共同目标：有勾选就处理全部勾选项，否则处理当前列表全部。
+ *
+ * 勾选项包括被当前筛选挡住、看不见的那些——与「批量操作（N个）」「删除（N个）」口径一致，
+ * 否则会出现「显示勾选了 1 个，点刷新却说没有可刷新的」。
+ * 顺序按界面卡片，看不见的排在后面；只取当前所在的一边（正常列表 / 回收站）。
  */
-const batchTargets = computed(() =>
-  selectedIds.value.length
-    ? filteredKeys.value.filter((entry) => selectedSet.value.has(entry.id))
-    : filteredKeys.value
-)
-/** 批量操作按钮的范围后缀：有勾选时把实际会处理的条数带到按钮上 */
+const batchTargets = computed(() => {
+  if (!selectedIds.value.length) return filteredKeys.value
+  const visible = filteredKeys.value.filter((entry) => selectedSet.value.has(entry.id))
+  const shown = new Set(visible.map((entry) => entry.id))
+  const hidden = data.value.keys.filter(
+    (entry) =>
+      selectedSet.value.has(entry.id) && !shown.has(entry.id) && isTrashed(entry) === trashView.value
+  )
+  return [...visible, ...hidden]
+})
+/** 批量操作按钮的范围后缀：有勾选时把实际会处理的条数（全部勾选数）带到按钮上 */
 const batchScopeSuffix = computed(() =>
-  visibleSelectedCount.value ? `（${visibleSelectedCount.value}个）` : ''
+  selectedIds.value.length ? `（${selectedIds.value.length}个）` : ''
 )
 const allVisibleSelected = computed(() => filteredKeys.value.length > 0 && visibleSelectedCount.value === filteredKeys.value.length)
 const someVisibleSelected = computed(() => visibleSelectedCount.value > 0 && !allVisibleSelected.value)
@@ -466,10 +548,6 @@ function displayKey(key: string): string {
   return maskedKey(key, privacyMode.value)
 }
 
-/** 邮箱跟随全局隐私打码，与账户管理一致 */
-function displayEmail(email: string): string {
-  return maskedEmail(email, privacyMode.value)
-}
 
 /** 备注同样跟随隐私打码：里面常写着用途、渠道等不比邮箱次要的信息 */
 function displayNote(note?: string): string {
@@ -478,32 +556,6 @@ function displayNote(note?: string): string {
 
 function togglePrivacy(): void {
   void settingsStore.update({ privacyMode: !privacyMode.value })
-}
-
-const BAR_COUNT = 40
-
-function usageRatio(entry: KeyEntry): number {
-  if (!entry.totalCredits || !Number.isFinite(entry.totalCredits)) return 0
-  return Math.min(1, Math.max(0, (entry.usedCredits || 0) / entry.totalCredits))
-}
-
-function usagePercent(entry: KeyEntry): number {
-  return usageRatio(entry) * 100
-}
-
-function usagePercentText(entry: KeyEntry): string {
-  const value = usagePercent(entry)
-  if (value <= 0) return '0'
-  if (value >= 100) return '100'
-  return value.toFixed(2)
-}
-
-function filledBars(entry: KeyEntry): number {
-  return Math.round(usageRatio(entry) * BAR_COUNT)
-}
-
-function keyUsageColor(entry: KeyEntry): string {
-  return usageColor(usageRatio(entry))
 }
 
 const usageSubject = computed(() => {
@@ -517,99 +569,10 @@ const usageSubject = computed(() => {
   }
 })
 
-/**
- * 卡片上要展示的问题原因：管理面同步错误与对话测活错误取并集。
- * 只看 lastError 会漏掉被封禁的 Key —— 它们在 Get-Usage-Limits 上返回 200，
- * 只有真实对话才会暴露 403。
- */
-/** 异常原因与跳过判定都走 shared/refreshPolicy，与主进程自动刷新保持同一口径 */
-function keyIssue(entry: KeyEntry): string | undefined {
-  return keyIssueOf(entry)
-}
-
-// ============ 网关调用统计 ============
-
-/** 该 Key 的网关统计；没跑过请求返回 undefined，各模块显示占位符 */
-function statsOf(entry: KeyEntry): KeyGatewayUsageStats | undefined {
-  const s = store.gatewayStats[entry.id]
-  return s && s.requests > 0 ? s : undefined
-}
-
-/** 数值型指标的展示：无数据统一用 - 占位 */
-function statText(entry: KeyEntry, field: 'requests' | 'rpm'): string {
-  const s = statsOf(entry)
-  return s ? String(s[field]) : '-'
-}
-
-function successRateText(entry: KeyEntry): string {
-  const s = statsOf(entry)
-  if (!s) return '-'
-  return ((s.succeeded / s.requests) * 100).toFixed(2)
-}
-
-/**
- * 积分消耗：取响应流里 MeteringEvent 的累计值，这是 Kiro 的计费口径。
- * 上游给的是长浮点（如 2.294253048623549），固定两位小数即可；
- * 上万后压成 k，避免撑破格子。请求跑过但没有计费事件时显示 0，与"从没跑过"的 - 区分。
- */
-function creditText(entry: KeyEntry): string {
-  const s = statsOf(entry)
-  if (!s) return '-'
-  if (s.metered >= 10000) return compactNumber(s.metered)
-  return s.metered.toFixed(2)
-}
-
-function requestTip(entry: KeyEntry): string {
-  const s = statsOf(entry)
-  if (!s) return '该 Key 尚未经本地网关发出过请求'
-  return (
-    `对话请求 ${s.requests} 次：成功 ${s.succeeded} / 失败 ${s.failed}` +
-    (s.auxRequests
-      ? `\n另有辅助请求 ${s.auxRequests} 次（/mcp、模型列表等），失败 ${s.auxFailed} 次，不计入成功率`
-      : '')
-  )
-}
-
-function creditTip(entry: KeyEntry): string {
-  const s = statsOf(entry)
-  if (!s) return '该 Key 尚未经本地网关发出过请求'
-  const unit = s.meteredUnit ? ` ${s.meteredUnit}` : ''
-  return (
-    `经网关累计消耗 ${s.metered.toFixed(4)}${unit}（来自服务端计费事件）\n` +
-    '点击查看积分消耗曲线与明细'
-  )
-}
-
-function successColor(entry: KeyEntry): string {
-  const s = statsOf(entry)
-  if (!s) return 'inherit'
-  const rate = s.succeeded / s.requests
-  if (rate >= 0.95) return '#52c41a'
-  if (rate >= 0.8) return '#faad14'
-  return '#ff4d4f'
-}
-
 /** 打开网关调用历史弹窗，metric 决定默认展示哪条曲线 */
 function openGatewayHistory(entry: KeyEntry, metric: 'requests' | 'credits'): void {
   gatewayHistoryMetric.value = metric
   gatewayHistoryTarget.value = entry
-}
-
-/** 大数字压成 12.3k / 1.2M，避免撑破卡片上的窄格子 */
-function compactNumber(n: number): string {
-  if (!n) return '0'
-  if (n < 1000) return String(n)
-  if (n < 1_000_000) return `${(n / 1000).toFixed(n < 10_000 ? 1 : 0)}k`
-  return `${(n / 1_000_000).toFixed(1)}M`
-}
-
-function keyStatus(entry: KeyEntry): { color: string; text: string } {
-  return KEY_STATUS_META[keyStatusKey(entry)]
-}
-
-/** 档位配色与账号管理共用同一张表：同一个订阅在两个页面看到同样的颜色 */
-function subscriptionColor(entry: KeyEntry): string {
-  return subscriptionMeta(keyTier(entry)).color
 }
 
 type BusyAction = 'select' | 'sync'
@@ -672,10 +635,15 @@ function remove(entry: KeyEntry): void {
     void doRemove()
     return
   }
+  const label = displayNote(entry.note) || displayKey(entry.key)
+  // 正常列表里多一个「放入回收站」；已在回收站里的再删就是彻底删除
   confirmDelete({
-    title: '删除 API Key',
-    content: `确认删除 ${displayNote(entry.note) || displayKey(entry.key)}？此操作不可撤销。`,
-    onOk: doRemove
+    title: trashView.value ? '彻底删除 API Key' : '删除 API Key',
+    content: trashView.value
+      ? `确认彻底删除 ${label}？删除后无法恢复。`
+      : `确认删除 ${label}？此操作不可撤销；也可以先放入回收站。`,
+    onOk: doRemove,
+    onTrash: trashView.value ? undefined : () => moveToTrash([entry.id], true)
   })
 }
 
@@ -838,6 +806,60 @@ function test(entry: KeyEntry): void {
   testTarget.value = entry
 }
 
+// ============ 右键菜单 ============
+
+/**
+ * 生成 API Key / 获取订阅链接要用账号的登录凭证，API Key 本身没有，
+ * 所以 Key 卡片的右键菜单只有备注、分组、回收站与删除。
+ */
+const normalMenu: ContextMenuItem[] = [
+  { key: 'note', label: '设置备注', icon: EditOutlined },
+  { key: 'group', label: '设置分组', icon: AppstoreOutlined },
+  { key: 'trash', label: '放入回收站', icon: RestOutlined, divided: true },
+  { key: 'remove', label: '删除该 API Key', icon: DeleteOutlined, danger: true }
+]
+
+const trashMenu: ContextMenuItem[] = [
+  { key: 'restore', label: '移出回收站', icon: RollbackOutlined },
+  { key: 'remove', label: '彻底删除', icon: DeleteOutlined, danger: true, divided: true }
+]
+
+/** 整页只有一个右键菜单实例；作用目标与高亮规则见 useCardContextMenu */
+const contextMenu = useCardContextMenu<KeyEntry>({ selectedIds })
+const menuTargetIds = contextMenu.targetIds
+const contextIds = contextMenu.highlight
+
+/** 卡片上「打开某个弹窗」类事件的稳定处理器：模板里写内联赋值会让每张可见卡片每次都重新渲染 */
+const cardHandlers = {
+  detail: (entry: KeyEntry) => (detailTarget.value = entry),
+  usage: (entry: KeyEntry) => (usageTarget.value = entry),
+  cli: (entry: KeyEntry) => (cliTarget.value = entry)
+}
+
+/** 作用于多项时，菜单文案带上数量 */
+const contextMenuItems = computed<ContextMenuItem[]>(() => {
+  const base = trashView.value ? trashMenu : normalMenu
+  const count = menuTargetIds.value.length
+  if (count <= 1) return base
+  return base.map((item) => ({
+    ...item,
+    label: item.key === 'remove' ? `${trashView.value ? '彻底删除' : '删除'}所选 API Key（${count}个）` : `${item.label}（${count}个）`
+  }))
+})
+
+function onContextMenu(key: string): void {
+  const entry = contextMenu.target.value
+  if (!entry) return
+  const ids = menuTargetIds.value.length ? menuTargetIds.value : [entry.id]
+  // 多项时勾选集合就是这批目标（见 useCardContextMenu），直接复用各个批量入口
+  const multi = ids.length > 1
+  if (key === 'note') multi ? (batchNoteOpen.value = true) : openEdit(entry)
+  else if (key === 'group') multi ? (batchGroupOpen.value = true) : (groupTarget.value = entry)
+  else if (key === 'trash') void moveToTrash([...ids], true)
+  else if (key === 'restore') void moveToTrash([...ids], false)
+  else if (key === 'remove') multi ? removeSelected() : remove(entry)
+}
+
 function removeSelected(): void {
   const ids = [...selectedIds.value]
   if (!ids.length) return void message.info('请先选择 API Key')
@@ -849,16 +871,20 @@ function removeSelected(): void {
       if (error) failed++
       else deletedIds.push(id)
     }
-    selectedIds.value = selectedIds.value.filter((id) => data.value.keys.some((entry) => entry.id === id))
+    const remaining = new Set(data.value.keys.map((entry) => entry.id))
+    selectedIds.value = selectedIds.value.filter((id) => remaining.has(id))
     clearDeletedKeyUi(deletedIds)
     const text = `已删除 ${deletedIds.length} 个${failed ? `，失败 ${failed} 个` : ''}`
     failed ? message.warning(text) : message.success(text)
   }
   if (!settingsStore.settings.confirmBeforeDeleteApiKey) return void execute()
   confirmDelete({
-    title: `删除 ${ids.length} 个 API Key`,
-    content: '删除后无法恢复；正在接管中使用的当前 Key 会被保护，不会删除。',
-    onOk: execute
+    title: trashView.value ? `彻底删除 ${ids.length} 个 API Key` : `删除 ${ids.length} 个 API Key`,
+    content: trashView.value
+      ? '删除后无法恢复。'
+      : '删除后无法恢复；正在接管中使用的当前 Key 会被保护，不会删除。也可以先放入回收站。',
+    onOk: execute,
+    onTrash: trashView.value ? undefined : () => moveToTrash(ids, true)
   })
 }
 
@@ -1115,9 +1141,26 @@ onUnmounted(() => store.stopStatsPolling())
 
     <div class="keys-header">
       <div class="toolbar">
+        <a-tooltip title="批量查询">
+          <a-button
+            :type="batchQuery.length ? 'primary' : 'default'"
+            aria-label="批量查询"
+            @click="batchQueryOpen = true"
+          >
+            <template #icon><FileSearchOutlined /></template>
+          </a-button>
+        </a-tooltip>
         <a-input v-model:value="search" allow-clear placeholder="搜索备注或 API Key" class="search-input">
           <template #prefix><SearchOutlined /></template>
         </a-input>
+        <BatchQueryTag
+          v-if="batchQuery.length"
+          :total="batchQuery.length"
+          :hits="batchQueryHits.hits"
+          :missing="batchQueryHits.missing"
+          @edit="batchQueryOpen = true"
+          @clear="batchQuery = []"
+        />
         <span class="spacer" />
         <a-button type="primary" @click="addOpen = true">
           <template #icon><PlusOutlined /></template>添加 API Key
@@ -1196,7 +1239,7 @@ onUnmounted(() => store.stopStatsPolling())
         <a-divider type="vertical" style="margin: 0 2px" />
         <a-button :size="toolbarSize" :loading="syncing" @click="syncAll">
           <template #icon><SyncOutlined /></template>
-          {{ syncing ? `正在刷新${visibleSelectedCount ? visibleSelectedCount + '个API Key' : ''}用量/积分...` : `刷新用量/积分${batchScopeSuffix}` }}
+          {{ syncing ? `正在刷新${selectedIds.length ? selectedIds.length + '个API Key' : ''}用量/积分...` : `刷新用量/积分${batchScopeSuffix}` }}
         </a-button>
         <a-button
           :size="toolbarSize"
@@ -1212,13 +1255,34 @@ onUnmounted(() => store.stopStatsPolling())
 
         <!-- 展示形态：卡片 / 紧凑 / 列表，选择会持久化 -->
         <DisplayModeSelect :value="displayMode" :size="toolbarSize" @change="setDisplayMode" />
+        <TrashToggle
+          :active="trashView"
+          :count="store.trashedCount"
+          :size="toolbarSize"
+          @toggle="toggleTrashView"
+        />
 
-        <a-button :size="toolbarSize" :disabled="!batchTargets.length" @click="batchTestOpen = true">
+        <!-- 回收站里只有「移出回收站 / 彻底删除」两种批量动作 -->
+        <a-button
+          v-if="trashView && selectedIds.length"
+          :size="toolbarSize"
+          @click="moveToTrash([...selectedIds], false)"
+        >
+          <template #icon><RollbackOutlined /></template>
+          移出回收站（{{ selectedIds.length }}个）
+        </a-button>
+
+        <a-button
+          v-if="!trashView"
+          :size="toolbarSize"
+          :disabled="!batchTargets.length"
+          @click="batchTestOpen = true"
+        >
           <template #icon><ThunderboltOutlined /></template>
           批量测活{{ batchScopeSuffix }}
         </a-button>
         <!-- 批量操作作用于全部勾选项 -->
-        <a-dropdown v-if="selectedIds.length">
+        <a-dropdown v-if="!trashView && selectedIds.length">
           <a-button :size="toolbarSize">
             批量操作（{{ selectedIds.length }}个）
             <DownOutlined />
@@ -1239,7 +1303,7 @@ onUnmounted(() => store.stopStatsPolling())
         <!-- 删除作用于全部勾选项（不受当前搜索影响），条数与确认弹窗里的数字一致 -->
         <a-button v-if="selectedIds.length" :size="toolbarSize" danger @click="removeSelected">
           <template #icon><DeleteOutlined /></template>
-          删除（{{ selectedIds.length }}个）
+          {{ trashView ? '彻底删除' : '删除' }}（{{ selectedIds.length }}个）
         </a-button>
         <a-divider type="vertical" style="margin: 0 2px" />
         <a-checkbox
@@ -1271,229 +1335,37 @@ onUnmounted(() => store.stopStatsPolling())
       :gap="displayMode === 'list' ? 8 : 10"
       :estimated-height="gridLayout.estimatedHeight"
     >
+      <!-- 事件一律绑定稳定的方法引用，props 没变的卡片不会被重新渲染（见 KeyCard） -->
       <template #default="{ item: entry }">
-        <a-card
-          class="key-card"
-        :class="[
-          `mode-${displayMode}`,
-          { active: entry.id === data.activeKeyId, selected: selectedSet.has(entry.id) }
-        ]"
-        @click="toggleSelect(entry.id, !selectedSet.has(entry.id))"
-      >
-        <div class="key-head">
-          <div class="key-name">
-            <a-checkbox
-              :checked="selectedSet.has(entry.id)"
-              @click.stop
-              @change="(event: any) => toggleSelect(entry.id, event.target.checked)"
-            />
-            <!--
-              整卡点击 = 勾选 / 取消勾选，有自己语义的区域各自 stop：
-              这块开详情，用量块开积分变化，统计格开曲线，右下动作区各干各的。
-            -->
-            <div class="key-identity" @click.stop="detailTarget = entry">
-              <span
-                class="key-value mono"
-                :title="privacyMode ? undefined : entry.key"
-              >{{ displayKey(entry.key) }}</span>
-              <span
-                class="key-email muted"
-                :title="entry.email && !privacyMode ? entry.email : undefined"
-              >邮箱：{{ entry.email ? displayEmail(entry.email) : '-' }}</span>
-              <span
-                class="key-note muted"
-                :title="entry.note && !privacyMode ? entry.note : undefined"
-              >备注：{{ displayNote(entry.note) || '-' }}</span>
-            </div>
-          </div>
-        </div>
-
-        <div class="tag-row">
-          <a-tag :color="keyStatus(entry).color" class="status-tag">
-            {{ keyStatus(entry).text }}
-          </a-tag>
-          <a-tag :color="subscriptionColor(entry)" :bordered="false">
-            {{ entry.subscription || '等级未知' }}
-          </a-tag>
-          <!-- 分组标签：没分组就不显示，避免每张卡都多一个空标签 -->
-          <a-tag
-            v-if="groupNameOf(entry)"
-            class="group-tag"
-            color="purple"
-            :bordered="false"
-            :title="`分组：${groupNameOf(entry)}`"
-          >
-            {{ groupNameOf(entry) }}
-          </a-tag>
-          <a-tooltip :title="`${regionLabel(entry.region)}，点击修改所属区域`">
-            <button class="region-chip mono" @click.stop="openRegion(entry)">
-              <GlobalOutlined />
-              {{ entry.region }}
-            </button>
-          </a-tooltip>
-        </div>
-
-        <div
-          class="usage-block"
-          title="点击查看积分变化"
-          @click.stop="usageTarget = entry"
-        >
-          <div class="usage-head">
-            <span class="usage-title">
-              <span class="muted">使用量</span>
-              <span
-                class="usage-updated muted"
-                :title="entry.lastCheckedAt ? `用量与积分更新于 ${formatDateTime(entry.lastCheckedAt)}` : undefined"
-              >
-                {{ entry.lastCheckedAt ? formatDateTime(entry.lastCheckedAt) : '尚未同步' }}
-              </span>
-            </span>
-            <strong class="usage-percent" :style="{ color: keyUsageColor(entry) }">
-              {{ usagePercentText(entry) }}<small>%</small>
-            </strong>
-          </div>
-          <div
-            class="usage-bars"
-            :style="{ '--bar-on': keyUsageColor(entry) }"
-            role="progressbar"
-            aria-valuemin="0"
-            aria-valuemax="100"
-            :aria-valuenow="Math.round(usagePercent(entry))"
-          >
-            <span
-              v-for="i in BAR_COUNT"
-              :key="i"
-              class="bar"
-              :class="{ on: i <= filledBars(entry) }"
-            />
-          </div>
-          <div class="usage-foot">
-            <span class="usage-number">
-              {{ formatCreditsPair(entry.usedCredits ?? 0, entry.totalCredits ?? 0, precision) }}
-            </span>
-            <!-- 与账号卡片同一位置的口径：有重置时间就显示它，否则退回额度说明 -->
-            <span v-if="entry.nextResetAt" class="muted" :title="`额度重置剩余 ${keyDaysRemaining(entry)} 天`">
-              <CalendarOutlined />
-              {{ formatDate(entry.nextResetAt) }} 重置
-            </span>
-            <span v-else class="muted">已用 / 总额度</span>
-          </div>
-        </div>
-
-        <!-- 网关实际调用统计：始终占位，没有数据显示 -，保证所有卡片高度一致 -->
-        <div class="stat-grid">
-          <div
-            class="stat-cell clickable"
-            :title="requestTip(entry)"
-            @click.stop="openGatewayHistory(entry, 'requests')"
-          >
-            <span class="stat-label">请求</span>
-            <strong class="stat-value">{{ statText(entry, 'requests') }}</strong>
-          </div>
-          <div
-            class="stat-cell clickable"
-            title="2xx 响应占全部请求的比例，点击查看成功率曲线"
-            @click.stop="openGatewayHistory(entry, 'requests')"
-          >
-            <span class="stat-label">成功率</span>
-            <strong class="stat-value" :style="{ color: successColor(entry) }">
-              {{ successRateText(entry) }}<small v-if="statsOf(entry)">%</small>
-            </strong>
-          </div>
-          <div
-            class="stat-cell clickable"
-            title="最近一分钟经网关发出的请求数（重启后重新计算），点击查看请求量曲线"
-            @click.stop="openGatewayHistory(entry, 'requests')"
-          >
-            <span class="stat-label">RPM</span>
-            <strong class="stat-value">{{ statText(entry, 'rpm') }}</strong>
-          </div>
-          <div
-            class="stat-cell clickable"
-            :title="creditTip(entry)"
-            @click.stop="openGatewayHistory(entry, 'credits')"
-          >
-            <span class="stat-label">积分</span>
-            <strong class="stat-value">{{ creditText(entry) }}</strong>
-          </div>
-        </div>
-
-        <!--
-          报错行只在真有问题时渲染。卡片等高由虚拟滚动的 itemExtra 保证：
-          只给「同一行里真有报错」的那一行加高，没报错的行不留空白。
-        -->
-        <a-tooltip v-if="keyIssue(entry)" placement="topLeft">
-          <template #title>
-            <span class="error-tip">{{ keyIssue(entry) }}</span>
-          </template>
-          <div class="error-line">{{ keyIssue(entry) }}</div>
-        </a-tooltip>
-
-        <!--
-          底部动作区的空白（切换按钮与右侧图标之间）照样落到整卡点击、切换勾选；
-          只拦按钮本身：切换按钮自带 .stop，右侧图标整排在 action-row 上拦
-        -->
-        <div class="key-actions">
-          <div class="key-switch-action">
-            <span v-if="entry.id === data.activeKeyId" class="current-key-label">
-              <CheckCircleFilled />
-              当前使用
-            </span>
-            <a-button
-              v-else
-              type="link"
-              size="small"
-              class="switch-key-btn"
-              :loading="actionBusy(entry.id, 'select')"
-              @click.stop="select(entry)"
-            >
-              <template #icon><SwapOutlined /></template>
-              切换到该 Key
-            </a-button>
-          </div>
-          <div class="action-row" @click.stop>
-            <a-tooltip title="刷新用量与积分">
-              <a-button
-                type="text"
-                size="small"
-                class="action-btn"
-                :loading="actionBusy(entry.id, 'sync')"
-                @click.stop="sync(entry)"
-              >
-                <template #icon><SyncOutlined /></template>
-              </a-button>
-            </a-tooltip>
-            <a-tooltip title="测活（发一次真实对话）">
-              <a-button type="text" size="small" class="action-btn" @click.stop="test(entry)">
-                <template #icon><ThunderboltOutlined /></template>
-              </a-button>
-            </a-tooltip>
-            <a-tooltip title="复制完整 API Key">
-              <a-button type="text" size="small" class="action-btn" @click.stop="copy(entry)">
-                <template #icon><CopyOutlined /></template>
-              </a-button>
-            </a-tooltip>
-            <a-tooltip title="使用此 API Key 连接 Kiro CLI">
-              <a-button type="text" size="small" class="action-btn" @click.stop="cliTarget = entry">
-                <template #icon><ApiOutlined /></template>
-              </a-button>
-            </a-tooltip>
-            <a-tooltip title="修改备注">
-              <a-button type="text" size="small" class="action-btn" @click.stop="openEdit(entry)">
-                <template #icon><EditOutlined /></template>
-              </a-button>
-            </a-tooltip>
-            <a-tooltip title="删除">
-              <a-button type="text" size="small" class="action-btn" danger @click.stop="remove(entry)">
-                <template #icon><DeleteOutlined /></template>
-              </a-button>
-            </a-tooltip>
-          </div>
-        </div>
-        </a-card>
+        <KeyCard
+          :entry="entry"
+          :stats="store.gatewayStats[entry.id]"
+          :active="entry.id === data.activeKeyId"
+          :selected="selectedSet.has(entry.id)"
+          :context-active="contextIds.has(entry.id)"
+          :mode="displayMode"
+          :selecting="actionBusy(entry.id, 'select')"
+          :syncing="actionBusy(entry.id, 'sync')"
+          @toggle-select="toggleSelect"
+          @detail="cardHandlers.detail"
+          @usage="cardHandlers.usage"
+          @region="openRegion"
+          @history="openGatewayHistory"
+          @select="select"
+          @sync="sync"
+          @test="test"
+          @copy="copy"
+          @cli="cardHandlers.cli"
+          @edit="openEdit"
+          @remove="remove"
+          @contextmenu="contextMenu.show"
+        />
       </template>
     </VirtualGrid>
-    <a-empty v-else class="empty" :description="data.keys.length ? '没有匹配的 Key' : '还没有 API Key，请先添加'" />
+    <a-empty v-else-if="trashView" class="empty" :description="store.trashedCount ? '回收站里没有符合条件的 Key' : '回收站是空的'">
+      <a-button @click="toggleTrashView">返回 API Key 列表</a-button>
+    </a-empty>
+    <a-empty v-else class="empty" :description="store.liveKeys.length ? '没有匹配的 Key' : '还没有 API Key，请先添加'" />
 
     <KiroCliConnectModal
       v-if="cliTarget"
@@ -1547,12 +1419,29 @@ onUnmounted(() => store.stopStatsPolling())
       @close="batchNoteOpen = false"
     />
 
+    <CardContextMenu
+      :open="contextMenu.state.open"
+      :x="contextMenu.state.x"
+      :y="contextMenu.state.y"
+      :items="contextMenuItems"
+      @select="onContextMenu"
+      @close="contextMenu.hide"
+    />
+    <BatchQueryModal
+      v-if="batchQueryOpen"
+      fields="API Key、邮箱、备注"
+      :initial="batchQuery"
+      placeholder="ksk_xxxxxxxx&#10;a@gmail.com&#10;备注里的关键字"
+      @submit="applyBatchQuery"
+      @close="batchQueryOpen = false"
+    />
     <GroupPickerModal
-      v-if="batchGroupOpen"
+      v-if="batchGroupOpen || groupTarget"
       :api="groupApi"
-      :ids="selectedIds"
+      :ids="groupPickIds"
       entity="Key"
-      @close="batchGroupOpen = false"
+      title-entity="API Key"
+      @close="closeGroupPicker"
       @manage="groupManageOpen = true"
     />
     <GroupManageModal
@@ -1738,201 +1627,6 @@ onUnmounted(() => store.stopStatsPolling())
 .search-input { width: 100%; max-width: 480px; }
 .spacer { flex: 1 1 auto; }
 .key-grid { flex: 1 1 auto; min-height: 0; }
-/* 整卡可点选；连着点几十张卡时不留下一片蓝色选中文字，要复制走详情抽屉或复制按钮 */
-.key-card {
-  width: 100%;
-  border: 1px solid var(--kal-border);
-  overflow: hidden;
-  cursor: pointer;
-  user-select: none;
-  transition: border-color 0.16s ease, box-shadow 0.16s ease, transform 0.16s ease;
-}
-/*
- * 悬停反馈与账号卡片（AccountCard）一致：浅阴影 + 上浮 1px。
- * 不用 a-card 的 hoverable，它的默认阴影明显更深，两页放在一起看很不统一。
- * 写在 selected / active 之前：同优先级时后者覆盖，选中态的描边阴影不被悬停冲掉。
- */
-.key-card:hover { box-shadow: 0 6px 20px rgba(0, 0, 0, 0.08); transform: translateY(-1px); }
-/* 列表模式不上浮：几十行同时排着，逐行抬起会显得很闹 */
-.key-card.mode-list:hover { transform: none; box-shadow: 0 2px 10px rgba(0, 0, 0, 0.06); }
-/* 用 padding 简写覆盖 antd 默认的 24px：左右也要收，不然横向留白比纵向大一截 */
-.key-card :deep(.ant-card-body) { padding: 6px 14px; }
-/*
- * 卡片 / 紧凑形态：卡片体改成纵向 flex 并铺满整卡，动作区用 margin-top: auto
- * 钉在底边，富余高度（虚拟滚动的统一行高减去本卡内容）落在它上方 —— 与账号卡片一致。
- *
- * 块间距随之改由 row-gap 统一给：auto 外边距会把「上一块的 margin-bottom」之外的
- * 空间全吃掉，靠各块自带的 margin-top 撑不出最小间距，而 gap 不受 auto 影响。
- * 所以子块不要再设 margin-top，否则会和 gap 叠加。
- */
-.key-card:not(.mode-list) { display: flex; flex-direction: column; }
-.key-card:not(.mode-list) :deep(.ant-card-body) {
-  flex: 1 1 auto;
-  display: flex;
-  flex-direction: column;
-  row-gap: 8px;
-}
-.key-card:not(.mode-list) .tag-row,
-.key-card:not(.mode-list) .usage-block,
-.key-card:not(.mode-list) .stat-grid,
-.key-card:not(.mode-list) .error-line { margin-top: 0; }
-.key-card:not(.mode-list) .key-actions { margin-top: auto; }
-.key-card.selected { border-color: var(--kal-primary); box-shadow: 0 0 0 1px var(--kal-primary) inset; }
-.key-card.active { border-color: #52c41a; box-shadow: none; }
-.key-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
-.key-name { display: flex; flex: 1 1 auto; align-items: flex-start; gap: 7px; min-width: 0; }
-.key-identity { flex: 1 1 auto; min-width: 0; line-height: 1.4; cursor: pointer; }
-.key-switch-action { display: flex; flex: 1 1 auto; align-items: center; min-width: 0; min-height: 24px; }
-.current-key-label { display: inline-flex; align-items: center; gap: 5px; color: #52c41a; font-size: 12px; font-weight: 600; }
-.switch-key-btn { height: 24px; padding: 0; font-size: 12px; }
-.key-value, .key-email, .key-note { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.key-value { font-size: 13px; font-weight: 600; transition: color 0.15s ease; }
-/* 悬停 key 区域时高亮 key 值，与账户卡片悬停邮箱一致 */
-.key-identity:hover .key-value { color: var(--kal-primary); }
-.key-email { margin-top: 2px; font-size: 12px; }
-.key-note { margin-top: 2px; font-size: 12px; }
-.status-tag { flex: 0 0 auto; margin: 0; }
-/* 标签一律排在同一行：不换行，宽度不够时由分组标签让位，区域标签不会被挤到下一行 */
-.tag-row { display: flex; flex-wrap: nowrap; align-items: center; gap: 6px; min-height: 22px; min-width: 0; margin-top: 10px; }
-.tag-row :deep(.ant-tag) { margin: 0; flex: 0 0 auto; }
-/*
- * 分组名是用户自己填的，长度不可控，所以让它独自承担收缩：
- * 能排下就完整显示（剩余宽度全归它用），排不下才截断成省略号，全名看悬停提示。
- */
-.tag-row .group-tag { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* 区域靠右对齐，与左侧的状态、等级标签同一行 */
-.region-chip { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 4px; margin-left: auto; padding: 1px 8px; border: 1px solid var(--kal-border); border-radius: 10px; background: transparent; color: var(--kal-muted); font-size: 11.5px; line-height: 18px; cursor: pointer; transition: border-color 0.15s ease, color 0.15s ease; }
-.region-chip:hover { border-color: var(--kal-primary); color: var(--kal-primary); }
-.field-hint { margin-top: 4px; font-size: 12px; line-height: 1.6; }
-/* 高度按内容自然撑开：各卡结构相同、高度本来就一致，写死 105px 只会多留几像素空白 */
-.usage-block { display: flex; flex-direction: column; gap: 4px; margin-top: 12px; padding: 10px 12px; box-sizing: border-box; border-radius: 12px; background: var(--kal-block-bg); cursor: pointer; transition: background 0.16s ease; }
-.usage-block:hover { background: var(--kal-code-bg); }
-.usage-head, .usage-foot { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; font-size: 12.5px; }
-.usage-title { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
-.usage-updated { max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
-.usage-percent { flex: 0 0 auto; font-size: 20px; font-weight: 700; line-height: 1; }
-.usage-percent small { margin-left: 1px; font-size: 12px; }
-.usage-bars { display: flex; align-items: stretch; gap: 2px; height: 14px; margin: 8px 0 10px; }
-.bar { flex: 1 1 0; border-radius: 2px; background: var(--kal-bar-off); transition: background 0.2s ease; }
-.bar.on { background: var(--bar-on); }
-.usage-number { font-weight: 600; }
-/* 右侧的重置日期不允许折行，与账号卡片一致 */
-.usage-foot span:last-child { white-space: nowrap; }
-/* 网关调用统计：四个等宽圆角小块，无边框，背景与上方使用量区块统一 */
-.stat-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 8px; }
-.stat-cell {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 1px;
-  padding: 7px 2px 6px;
-  border-radius: 10px;
-  background: var(--kal-block-bg);
-}
-.stat-cell.clickable { cursor: pointer; transition: background 0.16s ease; }
-.stat-cell.clickable:hover { background: var(--kal-code-bg); }
-.stat-label { color: var(--kal-muted); font-size: 11px; line-height: 1.2; }
-/* 成功率带两位小数后字符变长，格子窄时靠 clamp 缩字号，且禁止折行 */
-.stat-value { font-size: clamp(11px, 1.1vw, 14px); line-height: 1.25; white-space: nowrap; font-variant-numeric: tabular-nums; }
-.stat-value small { margin-left: 1px; font-size: 10px; font-weight: 400; }
-/*
- * 报错行。高度钉成确定值：18（行高）+ 3 + 3（上下 padding）= 24px。
- * 加上所在形态的块间距，就是带报错的卡比同类卡高出的部分 ——
- * 与上面 ERROR_ROW_EXTRA 的取值绑定，改这里要同步改那边。
- */
-.error-line { padding: 3px 8px; overflow: hidden; color: #ff4d4f; border-radius: 8px; background: rgba(255, 77, 79, 0.08); font-size: 11.5px; line-height: 18px; text-overflow: ellipsis; white-space: nowrap; cursor: help; }
-/* 卡片里一行截断，Tooltip 里完整换行展示 */
-.error-tip { white-space: pre-wrap; word-break: break-all; }
-.key-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 18px; padding: 8px 0 0; border-top: 1px solid var(--kal-border); }
-.action-row { display: flex; flex: 0 0 auto; align-items: center; gap: 0; }
-.action-btn { width: 24px; min-width: 24px; height: 24px; padding: 0; }
-/* ============ 紧凑卡片 ============ */
-/*
- * 去掉网关统计那四个小格；用量块压成两行（柱状条与百分比同排，下面是总额 + 更新时间），
- * 与账号卡片的紧凑模式同一套做法：display: contents 把 .usage-head 从布局里摘掉，
- * 让它的两个子元素直接成为用量块的 flex 项，再用 order 排位。
- */
-.key-card.mode-compact .stat-grid { display: none; }
-.key-card.mode-compact .usage-block,
-.key-card.mode-list .usage-block {
-  flex-direction: row;
-  flex-wrap: wrap;
-  align-items: center;
-  column-gap: 8px;
-  row-gap: 8px;
-}
-.key-card.mode-compact .usage-head,
-.key-card.mode-list .usage-head { display: contents; }
-.key-card.mode-compact .usage-title,
-.key-card.mode-list .usage-title { display: none; }
-.key-card.mode-compact .usage-bars,
-.key-card.mode-list .usage-bars { order: 1; flex: 1 1 auto; min-width: 60px; margin: 0; }
-.key-card.mode-compact .usage-percent,
-.key-card.mode-list .usage-percent { order: 2; font-size: 16px; }
-.key-card.mode-compact .usage-foot,
-.key-card.mode-list .usage-foot { order: 3; flex: 1 0 100%; }
-/* 内容压得紧，底部那条分隔线与它自身的上内边距都去掉（块间距与卡片模式同为 8px） */
-.key-card.mode-compact .key-actions { border-top: none; padding-top: 0; }
-
-/* ============ 列表模式 ============ */
-/*
- * 一条 = 四块：Key 信息 | 标签 | 用量 | 操作区，标签那块顺带吃掉全部富余宽度。
- * 与账号列表同一套：网格 + 容器查询按「卡片实际可用宽度」分档，
- * 窄了依次把标签、用量、操作区挪到下一行，不挤压也不横向溢出。
- *
- * 真正的布局容器是 a-card 的 body（卡片自己只是外壳），所以规则打在 :deep 上。
- */
-.key-card.mode-list { cursor: pointer; }
-.key-card.mode-list :deep(.ant-card-body) {
-  display: grid;
-  grid-template-columns: 400px minmax(190px, 1fr) 350px 320px;
-  align-items: center;
-  align-content: center;
-  column-gap: 18px;
-  row-gap: 8px;
-  padding: 8px 14px;
-}
-/* 每块写死落位：报错行跨整行、自动摆放的游标不能回退，不写死会把操作区顶到下一行 */
-.key-card.mode-list .key-head { grid-area: 1 / 1 / 2 / 2; }
-.key-card.mode-list .tag-row { grid-area: 1 / 2 / 2 / 3; margin-top: 0; }
-.key-card.mode-list .usage-block { grid-area: 1 / 3 / 2 / 4; margin-top: 0; }
-.key-card.mode-list .key-actions { grid-area: 1 / 4 / 2 / 5; margin-top: 0; padding-top: 0; border-top: none; }
-.key-card.mode-list .stat-grid { display: none; }
-.key-card.mode-list .error-line { grid-column: 1 / -1; margin-top: 0; }
-/* 区域标签在窄列里不必再靠右顶开 */
-.key-card.mode-list .region-chip { margin-left: 0; }
-.key-card.mode-list .tag-row { flex-wrap: nowrap; min-width: 0; margin-left: 6px; overflow: hidden; }
-.key-card.mode-list .usage-bars { height: 10px; }
-/* 「切换到该 Key」在一行里太长，收成图标按钮那一排的同级元素 */
-.key-card.mode-list .key-switch-action { flex: 0 0 auto; }
-
-/* 窄一档：标签掉到第二行铺满整宽 */
-@container (max-width: 1343px) {
-  .key-card.mode-list :deep(.ant-card-body) {
-    grid-template-columns: 400px minmax(0, 1fr) 350px 320px;
-  }
-  .key-card.mode-list .tag-row { grid-area: 2 / 1 / 3 / -1; margin-left: 0; }
-}
-
-/* 再窄一档：操作区掉到用量下面，第一行只剩「Key | 富余 | 用量」 */
-@container (max-width: 1153px) {
-  .key-card.mode-list :deep(.ant-card-body) {
-    grid-template-columns: minmax(0, 400px) minmax(0, 1fr) 350px;
-  }
-  .key-card.mode-list .usage-block { grid-area: 1 / 3 / 2 / 4; }
-  .key-card.mode-list .tag-row { grid-area: 2 / 1 / 3 / 3; }
-  .key-card.mode-list .key-actions { grid-area: 2 / 3 / 3 / 4; }
-}
-
-/* 兜底档：逐块竖排，正常窗口到不了这里 */
-@container (max-width: 745px) {
-  .key-card.mode-list :deep(.ant-card-body) { grid-template-columns: minmax(0, 1fr); }
-  .key-card.mode-list .key-head,
-  .key-card.mode-list .tag-row,
-  .key-card.mode-list .usage-block,
-  .key-card.mode-list .key-actions { grid-area: auto / 1 / auto / -1; }
-}
-
 .empty { margin: 70px 0; }
 .port-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
 .port-row :deep(.ant-input-number) { width: 100%; }

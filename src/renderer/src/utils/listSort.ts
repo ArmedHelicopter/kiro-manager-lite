@@ -14,7 +14,12 @@ export type SortField =
   | 'remainingCredits'
   | 'reset'
   | 'token'
+  | 'recent30'
+  | 'recent60'
 export type SortDir = 'asc' | 'desc'
+
+/** 按最近一段时间实际消耗排序的两个字段，值要另外向主进程批量取 */
+export const RECENT_SORT_FIELDS: readonly SortField[] = ['recent30', 'recent60']
 export type SortKey = `${SortField}:${SortDir}`
 
 export interface SortFieldOption {
@@ -29,6 +34,8 @@ export const SORT_FIELDS: SortFieldOption[] = [
   { field: 'usage', label: '用量占比' },
   { field: 'usedCredits', label: '使用积分' },
   { field: 'remainingCredits', label: '剩余积分' },
+  { field: 'recent30', label: '近半小时积分用量' },
+  { field: 'recent60', label: '近1小时积分用量' },
   { field: 'reset', label: '剩余重置天数' },
   { field: 'token', label: 'Token 有效期' }
 ]

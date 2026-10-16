@@ -29,6 +29,7 @@ import {
   usageColor
 } from '@/utils/format'
 import { displayEmail, displayName, displayNote } from '@/utils/display'
+import { groupsOfItem } from '@/utils/groups'
 import { now } from '@/utils/now'
 import type { Account, AccountDisplayMode } from '@shared/types'
 
@@ -36,6 +37,8 @@ const props = withDefaults(
   defineProps<{
     account: Account
     selected: boolean
+    /** 右键菜单正作用于这张卡片（菜单打开期间高亮，关掉即恢复） */
+    contextActive?: boolean
     /** 正在进行中的操作，只让对应按钮转圈 */
     busyAction?: string | null
     /**
@@ -49,25 +52,33 @@ const props = withDefaults(
 
 const busy = computed(() => !!props.busyAction)
 
+/*
+ * 所有事件都把本卡片的账号（或 id）作为参数带出去。
+ * 这样父组件可以直接绑定稳定的方法引用，不必在虚拟滚动插槽里写
+ * `@xxx="() => fn(item.account)"` —— 内联箭头函数每次渲染都是新对象，
+ * 会让每张可见卡片在列表任何变化时都被判定 props 变了而整卡重新 patch。
+ */
 const emit = defineEmits<{
-  'toggle-select': [boolean]
-  detail: []
-  edit: []
-  remove: []
-  switch: []
-  logout: []
-  'refresh-key': []
-  'refresh-usage': []
-  'copy-token': []
-  test: []
+  'toggle-select': [id: string, checked: boolean]
+  detail: [account: Account]
+  edit: [account: Account]
+  remove: [account: Account]
+  switch: [account: Account]
+  logout: [account: Account]
+  'refresh-key': [account: Account]
+  'refresh-usage': [account: Account]
+  'copy-token': [account: Account]
+  test: [account: Account]
   /** 用该账号凭证生成一个新的 Kiro API Key */
-  'create-api-key': []
+  'create-api-key': [account: Account]
   /** 用该账号凭证打开官网后台 */
-  portal: []
+  portal: [account: Account]
   /** 点订阅标签：管理订阅或开通订阅 */
-  subscription: []
+  subscription: [account: Account]
   /** 点用量区域查看积分变化日志 */
-  usage: []
+  usage: [account: Account]
+  /** 右键整卡：原生事件 + 本卡账号，菜单由父组件统一渲染 */
+  contextmenu: [event: MouseEvent, account: Account]
 }>()
 
 const accountsStore = useAccountsStore()
@@ -83,11 +94,10 @@ const nickname = computed(() => displayName(props.account, privacy.value))
 /** 备注在隐私模式下整段遮住；留空时显示占位符，保证同排卡片高度一致 */
 const note = computed(() => displayNote(props.account.note, privacy.value))
 
-/** 所属分组名；分组已被删除时按未分组处理，标签不显示 */
-const groupName = computed(() => {
-  const id = props.account.groupId
-  return id ? accountsStore.groupMap.get(id)?.name ?? '' : ''
-})
+/** 所属分组（可多个，按分组顺序）；已被删除的分组不显示 */
+const groupNames = computed(() =>
+  groupsOfItem(props.account, accountsStore.groups).map((group) => group.name)
+)
 
 /** 使用率百分比原始值，用量条与文案各自再做取整 */
 const rawPercent = computed(() => (props.account.usage.percentUsed || 0) * 100)
@@ -251,10 +261,18 @@ function isLoading(item: CardAction): boolean {
  * emit 的重载签名不接受联合类型，这里收窄成「无参事件名」的形态再调用；
  * ActionKey 已经限定了取值范围，不会派发出未声明的事件。
  */
-const emitAction = emit as (event: ActionKey) => void
+const emitAction = emit as (event: ActionKey | 'detail' | 'subscription' | 'usage', account: Account) => void
 
-function trigger(key: ActionKey): void {
-  emitAction(key)
+function trigger(key: ActionKey | 'detail' | 'subscription' | 'usage'): void {
+  emitAction(key, props.account)
+}
+
+function onCheckChange(e: { target: { checked: boolean } }): void {
+  emit('toggle-select', props.account.id, e.target.checked)
+}
+
+function onContextMenu(e: MouseEvent): void {
+  emit('contextmenu', e, props.account)
 }
 
 /**
@@ -265,7 +283,7 @@ function trigger(key: ActionKey): void {
  * 各自 @click.stop 拦下事件，剩下的空白与标签、额度、报错行都落到这里。
  */
 function onCardClick(): void {
-  emit('toggle-select', !props.selected)
+  emit('toggle-select', props.account.id, !props.selected)
 }
 </script>
 
@@ -274,18 +292,23 @@ function onCardClick(): void {
     class="account-card"
     :class="[
       `mode-${props.mode}`,
-      { 'is-selected': props.selected, 'is-active': props.account.isActive }
+      {
+        'is-selected': props.selected,
+        'is-active': props.account.isActive,
+        'is-context': props.contextActive
+      }
     ]"
     @click="onCardClick"
+    @contextmenu="onContextMenu"
   >
     <div class="card-head">
       <!-- 复选框自己会派发 change，再冒泡给整卡就会连着切两次，这里拦下 -->
       <a-checkbox
         :checked="props.selected"
         @click.stop
-        @change="(e: any) => emit('toggle-select', e.target.checked)"
+        @change="onCheckChange"
       />
-      <div class="identity" @click.stop="emit('detail')">
+      <div class="identity" @click.stop="trigger('detail')">
         <span class="email" :title="privacy ? undefined : props.account.email">{{ email }}</span>
         <span class="nickname">{{ nickname }}</span>
         <span
@@ -299,14 +322,18 @@ function onCardClick(): void {
       <a-tag :color="status.color" class="status-tag">{{ status.text }}</a-tag>
     </div>
 
-    <div class="tag-row">
+    <!--
+      data-vg-grow：分组多了折到第二行时，虚拟滚动量出多出来的高度，只让这张卡所在的那一行加高
+      （与报错行同一个口径），不会把所有卡片一起撑高。
+    -->
+    <div class="tag-row" data-vg-grow>
       <!--
         订阅标签可点：已订阅进 Stripe 账单管理，未订阅弹出可开通档位。
         点击事件挂在外层 span 而不是 a-tag 上：a-tag 一旦带 onClick 就会自动套上
         Wave（antd 的点击涟漪），在卡片里表现为一个扩散到用量条上的浅色方框。
       -->
       <a-tooltip title="管理订阅状态">
-        <span class="subscription-tag" @click.stop="emit('subscription')">
+        <span class="subscription-tag" @click.stop="trigger('subscription')">
           <a-tag :color="subscription.color" :bordered="false">
             {{ subscriptionText }}
             <!-- 订阅名后面的信息图标：提示这个标签是可点的入口，纯展示的标签没有它 -->
@@ -315,9 +342,10 @@ function onCardClick(): void {
         </span>
       </a-tooltip>
       <a-tag :color="idp.color" :bordered="false">{{ idp.text }}</a-tag>
-      <!-- 分组标签：没分组就不显示，避免每张卡都多一个空标签 -->
+      <!-- 分组标签：没分组就不显示，避免每张卡都多一个空标签；多个分组各占一个标签 -->
       <a-tag
-        v-if="groupName"
+        v-for="groupName in groupNames"
+        :key="groupName"
         class="group-tag"
         color="purple"
         :bordered="false"
@@ -331,7 +359,7 @@ function onCardClick(): void {
     <div
       class="usage-block"
       :title="`点击查看积分变化 · 用量与积分更新于 ${formatDateTime(props.account.lastCheckedAt)}`"
-      @click.stop="emit('usage')"
+      @click.stop="trigger('usage')"
     >
       <div class="usage-head">
         <span class="usage-title">
@@ -471,6 +499,7 @@ function onCardClick(): void {
   user-select: none;
   transition:
     border-color 0.16s ease,
+    background-color 0.16s ease,
     box-shadow 0.16s ease,
     transform 0.16s ease;
 }
@@ -488,6 +517,20 @@ function onCardClick(): void {
 /* 当前使用的账号：只用绿边标识，背景保持和其它卡片一致 */
 .account-card.is-active {
   border-color: #52c41a;
+}
+
+/*
+ * 右键菜单作用中的卡片：浅色半透明主题色边框 + 很浅的主题色底，菜单关掉即恢复。
+ * 放在 is-active 之后，右键「使用中」的那张时也能看出来是它。
+ * 已勾选的卡片保留实心勾选边框，只叠加底色。
+ */
+.account-card.is-context {
+  border-color: color-mix(in srgb, var(--kal-primary) 45%, transparent);
+  background-color: color-mix(in srgb, var(--kal-primary) 3%, var(--kal-card-bg));
+}
+
+.account-card.is-context.is-selected {
+  border-color: var(--kal-primary);
 }
 
 .card-head {
@@ -539,26 +582,27 @@ function onCardClick(): void {
   flex: 0 0 auto;
 }
 
-/* 标签一律排在同一行：不换行，宽度不够时由分组标签让位 */
+/*
+ * 标签排不下时自动换行：一个账号可以属于多个分组，挤在一行只能全部截成省略号。
+ * 每个标签保持完整宽度，放不下就整个挪到下一行（列表模式另有单行规则，见下方）。
+ */
 .tag-row {
   display: flex;
-  flex-wrap: nowrap;
-  gap: 4px 0;
+  flex-wrap: wrap;
+  gap: 6px 0;
   min-width: 0;
 }
 
-/* 订阅、登录方式这些标签内容固定且短，不参与收缩 */
 .tag-row > * {
   flex: 0 0 auto;
 }
 
 /*
- * 分组名是用户自己填的，长度不可控，所以让它独自承担收缩：
- * 能排下就完整显示（不设固定上限，剩余宽度全归它用），
- * 排不下才截断成省略号，全名看悬停提示。
+ * 分组名是用户自己填的，长度不可控：一般完整显示，
+ * 只有单个名字长过整行时才截断成省略号，全名看悬停提示。
  */
 .tag-row .group-tag {
-  flex: 0 1 auto;
+  max-width: 100%;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;

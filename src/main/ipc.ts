@@ -135,6 +135,7 @@ import {
   syncAllKeys,
   setKeyGroups,
   setKeysGroup,
+  setKeysTrashed,
   setKeysNote,
   syncKey,
   testKey,
@@ -153,6 +154,7 @@ import {
   getShellApproveBackup,
   proxyClientBackupTargets,
   getStorePath,
+  flushStore,
   saveProxyConfig,
   setAccountData,
   setSettings
@@ -160,6 +162,7 @@ import {
 import {
   appendUsagePoint,
   clearUsageHistory,
+  getRecentUsage,
   getUsageHistory,
   pruneUsageHistory
 } from './usageHistory'
@@ -251,6 +254,10 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
 
   // ============ 积分变化日志 ============
   handle('usage:history', (_e, accountId: string) => ok(getUsageHistory(accountId)))
+  // 列表按「最近半小时 / 一小时消耗」排序时批量取值；API Key 的 id 要带 key: 前缀
+  handle('usage:recent', (_e, subjectIds: string[]) =>
+    ok(getRecentUsage(Array.isArray(subjectIds) ? subjectIds : []))
+  )
 
   handle('usage:record', (_e, accountId: string, usage: AccountUsage) =>
     ok({ recorded: appendUsagePoint(accountId, usage) })
@@ -393,8 +400,11 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
   handle('keys:update', (_e, id: string, note: string) => ok(updateKey(id, note)))
   handle('keys:set-note', (_e, ids: string[], note: string) => ok(setKeysNote(ids, note)))
   handle('keys:set-groups', (_e, groups: AccountGroup[]) => ok(setKeyGroups(groups)))
-  handle('keys:set-group', (_e, ids: string[], groupId: string | null) =>
-    ok(setKeysGroup(ids, groupId))
+  handle('keys:set-group', (_e, ids: string[], groupIds: string[] | string | null) =>
+    ok(setKeysGroup(ids, groupIds))
+  )
+  handle('keys:set-trashed', (_e, ids: string[], trashed: boolean) =>
+    ok(setKeysTrashed(ids, trashed === true))
   )
   handle('keys:set-region', async (_e, id: string, region: string) =>
     ok(await updateKeyRegion(id, region))
@@ -876,6 +886,8 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
     await clipboard.writeText(typeof text === 'string' ? text : String(text ?? ''))
     return ok()
   })
+  // 读剪贴板同理只能在主进程做（批量查询的「粘贴」按钮）
+  handle('clipboard:read', async () => ok(await clipboard.readText()))
 
   handle('app:show-path', (_e, target: 'store' | 'backup' | 'logs') => {
     const paths = { store: app.getPath('userData'), backup: ensureBackupDir(), logs: getLogDir() }
@@ -920,9 +932,12 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
         message: '数据已处理完成',
         detail: '开发模式下无法自动重启（dev server 会随应用一起退出），请重新运行 npm run dev。'
       })
+      flushStore()
       app.exit(0)
       return
     }
+    // app.exit 不走 will-quit：导入写进主库的数据要在这里立即落盘
+    flushStore()
     app.relaunch()
     app.exit(0)
   }

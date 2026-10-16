@@ -1,6 +1,6 @@
 // API Key 管理与网关编排层
 import { randomUUID } from 'crypto'
-import { getKeyData, setKeyData } from './store'
+import { getKeyData, setKeyData, viewKeyData } from './store'
 import { appendUsagePoint, clearUsageHistory, pruneKeyUsageHistory } from './usageHistory'
 import { clearGatewayHistory, pruneGatewayHistory } from './gatewayHistory'
 import { discardGatewayStats } from './gatewayStats'
@@ -26,6 +26,7 @@ import { assertKeyGatewaySupported } from './kiroCapability'
 import { releasePorts } from './localPorts'
 import { log } from './logger'
 import { shouldSkipKeyUsageRefresh } from '../shared/refreshPolicy'
+import { groupIdsOf, isTrashed, withGroupIds } from '../shared/itemGroups'
 import type {
   AccountGroup,
   AccountUsage,
@@ -48,12 +49,13 @@ let stopEndpointWatch: (() => void) | null = null
  */
 const FORWARD_EVIDENCE_WINDOW_MS = 30 * 60_000
 
-function activeEntry(data = getKeyData()): KeyEntry | undefined {
+function activeEntry(data: Readonly<KeyGatewayData> = viewKeyData()): KeyEntry | undefined {
   return data.keys.find((entry) => entry.id === data.activeKeyId)
 }
 
+/** 网关每个请求都会调：只读视图，不做整表深拷贝 */
 function activeCredential(): { id: string; key: string } | null {
-  const data = getKeyData()
+  const data = viewKeyData()
   if (!data.enabled) return null
   const entry = activeEntry(data)
   return entry ? { id: entry.id, key: entry.key } : null
@@ -64,7 +66,7 @@ function activeCredential(): { id: string; key: string } | null {
  * 每次请求都重新读取，换 Key 后无需重启网关即可切到新区域。
  */
 function region(): string {
-  const data = getKeyData()
+  const data = viewKeyData()
   return activeEntry(data)?.region || data.region
 }
 
@@ -300,9 +302,12 @@ export function setKeyGroups(groups: AccountGroup[]): KeyGatewayData {
     next.push({ id, name, order: next.length })
   }
   data.groups = next
-  for (const entry of data.keys) {
-    if (entry.groupId && !seen.has(entry.groupId)) delete entry.groupId
-  }
+  // 只摘掉已删除的那几个分组，其余分组保持不变
+  data.keys = data.keys.map((entry) => {
+    const ids = groupIdsOf(entry)
+    const kept = ids.filter((id) => seen.has(id))
+    return kept.length === ids.length && entry.groupIds ? entry : withGroupIds(entry, kept)
+  })
   setKeyData(data)
   return data
 }
@@ -324,21 +329,39 @@ export function setKeysNote(ids: string[], note: string): KeyGatewayData {
 }
 
 /**
- * 批量设置分组：groupId 传 null 表示移出分组。
- * 传了 id 但分组不存在时直接报错，避免把悬空 id 写进存档。
+ * 批量设置分组：把所选 Key 的分组整体替换成 groupIds，空数组表示移出全部分组。
+ * 有任何一个分组不存在时直接报错，避免把悬空 id 写进存档。
+ *
+ * 兼容旧版渲染层：第二个参数传单个 id 或 null 也照常处理。
  */
-export function setKeysGroup(ids: string[], groupId: string | null): KeyGatewayData {
+export function setKeysGroup(ids: string[], groupIds: string[] | string | null): KeyGatewayData {
   const data = getKeyData()
-  if (groupId && !(data.groups ?? []).some((group) => group.id === groupId)) {
-    throw new Error('未找到该分组')
-  }
+  const wanted = Array.isArray(groupIds) ? groupIds : groupIds ? [groupIds] : []
+  const existing = new Set((data.groups ?? []).map((group) => group.id))
+  if (wanted.some((id) => !existing.has(id))) throw new Error('未找到该分组')
   const target = new Set(ids.filter(Boolean))
-  for (const entry of data.keys) {
-    if (!target.has(entry.id)) continue
-    if (groupId) entry.groupId = groupId
-    // 未分组用「不存在该字段」表示，置 undefined 会把 undefined 写进存档
-    else delete entry.groupId
+  data.keys = data.keys.map((entry) => (target.has(entry.id) ? withGroupIds(entry, wanted) : entry))
+  setKeyData(data)
+  return data
+}
+
+/**
+ * 放入 / 移出回收站。
+ * 接管中正在使用的当前 Key 不允许放入：放进去后界面上就找不到它，网关却还在用它转发请求。
+ */
+export function setKeysTrashed(ids: string[], trashed: boolean): KeyGatewayData {
+  const data = getKeyData()
+  const target = new Set(ids.filter(Boolean))
+  if (trashed && data.enabled && data.activeKeyId && target.has(data.activeKeyId)) {
+    throw new Error('当前接管中使用的 Key 不能放入回收站，请先选择其它 Key 或关闭接管')
   }
+  const now = Date.now()
+  data.keys = data.keys.map((entry) => {
+    if (!target.has(entry.id)) return entry
+    if (trashed) return isTrashed(entry) ? entry : { ...entry, trashedAt: now }
+    const { trashedAt: _drop, ...rest } = entry
+    return rest as KeyEntry
+  })
   setKeyData(data)
   return data
 }
@@ -540,7 +563,8 @@ export async function syncKey(id: string): Promise<KeyGatewayData> {
 export async function syncAllKeys(
   concurrency = 5
 ): Promise<{ data: KeyGatewayData; success: number; failed: number; skipped: number }> {
-  const all = getKeyData().keys
+  // 回收站里的 Key 是冷藏的，不参与批量同步
+  const all = getKeyData().keys.filter((entry) => !isTrashed(entry))
   const ids = all.filter((entry) => !shouldSkipKeyUsageRefresh(entry)).map((entry) => entry.id)
   const skipped = all.length - ids.length
   const batchSize = Math.max(1, Math.min(Math.round(Number(concurrency) || 5), 20))

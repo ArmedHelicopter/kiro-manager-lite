@@ -69,6 +69,46 @@ export function getUsageHistory(accountId: string): UsageHistoryEntry[] {
   return history()[accountId] ?? []
 }
 
+/** 最近消耗统计的两个窗口：半小时与一小时 */
+export interface RecentUsage {
+  m30: number
+  m60: number
+}
+
+const HALF_HOUR_MS = 30 * 60_000
+const HOUR_MS = 60 * 60_000
+
+/**
+ * 一批账号 / Key 最近半小时、一小时实际消耗的积分，供列表排序用。
+ *
+ * 取窗口内各条记录的 delta 之和：delta 是相邻两次快照之间的增量，正好就是这段时间的消耗。
+ * 只累加正数：额度重置时已用量会归零，delta 是负的，那不是「消耗」。
+ * 数据只到最近一次刷新为止，刷新间隔越短越准。
+ *
+ * 一次 IPC 批量算完：列表排序要所有条目的值，逐条取会是上千次往返。
+ * 从末尾往前扫，遇到窗口外的记录就停，每个条目只看最近几条。
+ */
+export function getRecentUsage(subjectIds: string[], at: number = Date.now()): Record<string, RecentUsage> {
+  const all = history()
+  const result: Record<string, RecentUsage> = {}
+  for (const id of subjectIds) {
+    const entries = all[id]
+    if (!entries?.length) continue
+    let m30 = 0
+    let m60 = 0
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const entry = entries[i]
+      const age = at - entry.at
+      if (age > HOUR_MS) break
+      const delta = entry.delta > 0 ? entry.delta : 0
+      m60 += delta
+      if (age <= HALF_HOUR_MS) m30 += delta
+    }
+    result[id] = { m30: Number(m30.toFixed(6)), m60: Number(m60.toFixed(6)) }
+  }
+  return result
+}
+
 /**
  * 记录一次积分快照。
  *

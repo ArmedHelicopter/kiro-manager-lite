@@ -179,20 +179,55 @@ function peek<K extends keyof Schema>(key: K): Readonly<Schema[K]> {
   return snapshot[key]
 }
 
-function write<K extends keyof Schema>(key: K, value: Schema[K]): void {
-  /*
-   * conf 16 的 set 重载按具体键推导值类型，泛型 K 下这几个重载都匹配不上。
-   * 这里的键值对由上面的 Schema 保证，断言只是绕开重载推导。
-   */
-  ;(store.set as (key: K, value: Schema[K]) => void)(key, value)
-  snapshot ??= store.store
-  snapshot[key] = JSON.parse(JSON.stringify(value)) as Schema[K]
+/**
+ * 写入合并：快照立即更新（之后的读取马上看到新值），落盘攒一小段时间再一次写完。
+ *
+ * 为什么要合并：conf 的每次 set 都要把整个文件读回来、pbkdf2 派生密钥、解密、JSON.parse，
+ * 改完再派生一次密钥、加密、整份写盘。这个文件装着全部账号，上千个账号时一次就是上百毫秒的主线程阻塞；
+ * 批量同步 Key、批量测活、反代刷新 Token 时每秒可能写几十次，界面与 IPC 会被卡住。
+ * 合并后同一段时间内的多次修改只落一次盘，内容和逐次写完全一致（写的就是最新快照）。
+ *
+ * 只延迟 STORE_FLUSH_MS：正常退出、导入后重启、清除数据前都会立即 flushStore，
+ * 只有进程被强杀时可能丢最后这一小段的修改。
+ */
+const STORE_FLUSH_MS = 300
+const dirtyKeys = new Set<keyof Schema>()
+let storeFlushTimer: NodeJS.Timeout | null = null
+
+/** 把待写的键一次写进磁盘；退出、重启、导出前调用 */
+export function flushStore(): void {
+  if (storeFlushTimer) {
+    clearTimeout(storeFlushTimer)
+    storeFlushTimer = null
+  }
+  if (!snapshot || !dirtyKeys.size) return
+  const patch: Partial<Schema> = {}
+  for (const key of dirtyKeys) (patch as Record<string, unknown>)[key] = snapshot[key]
+  dirtyKeys.clear()
+  // 对象形式的 set 一次写完全部键：只读一次文件、只加密写一次
+  ;(store.set as (patch: Partial<Schema>) => void)(patch)
 }
+
+function write<K extends keyof Schema>(key: K, value: Schema[K]): void {
+  snapshot ??= store.store
+  // 快照里存 JSON 往返后的值，与之后从磁盘读回的内容完全一致，也和调用方的对象断开引用
+  snapshot[key] = JSON.parse(JSON.stringify(value)) as Schema[K]
+  dirtyKeys.add(key)
+  if (storeFlushTimer) return
+  storeFlushTimer = setTimeout(flushStore, STORE_FLUSH_MS)
+}
+
+// 兜底：任何退出路径（含 app.exit）在进程结束前都把没写的写掉
+process.on('exit', flushStore)
 
 // ============ 初始化 ============
 
 /** 主库回到出厂默认值 */
 export function resetStoreData(): void {
+  // 清空前丢掉待写的修改，否则它会在清空之后把旧数据又写回去
+  if (storeFlushTimer) clearTimeout(storeFlushTimer)
+  storeFlushTimer = null
+  dirtyKeys.clear()
   store.clear()
   snapshot = null
 }
@@ -423,7 +458,16 @@ const VALID_SUBSCRIPTION_TYPES = new Set<string>([
  * 时跑一次，热重载或 store 状态被保留时根本不会执行。
  * 幂等；title 缺失时无判据，只把已废弃的档位归到 Free，其余保持原值。
  */
+/**
+ * 已对齐过的账号表（按对象身份记）。快照里的账号表只在写入时整体换新，
+ * 同一个对象对齐一次就够了；反代每个请求都经 viewAccountData 读一次，
+ * 不记的话上千个账号每个请求都要整表再扫一遍。
+ */
+const alignedTables = new WeakSet<AccountStoreData>()
+
 function alignSubscriptionTypes(data: AccountStoreData): AccountStoreData {
+  if (alignedTables.has(data)) return data
+  alignedTables.add(data)
   let changed = false
   for (const account of data.accounts) {
     const sub = account.subscription
@@ -518,8 +562,28 @@ export function getStorePath(): string {
 
 // ============ Key 网关数据 ============
 
+/** Key 网关数据的独立副本：调用方可以修改，改完经 setKeyData 落盘 */
 export function getKeyData(): KeyGatewayData {
-  const data = read('keyData') as Partial<KeyGatewayData> | undefined
+  return normalizeKeyData(read('keyData') as Partial<KeyGatewayData> | undefined)
+}
+
+/**
+ * Key 网关数据的只读视图，按快照对象身份缓存，写入后自动失效。
+ *
+ * 网关每转发一个请求都要读当前 Key 与区域，走 getKeyData 就是整表深拷贝再逐条补默认值；
+ * 上千个 Key 时这一步每个请求都要好几毫秒。返回值不能修改，要改的调用方用 getKeyData。
+ */
+let keyView: { source: unknown; data: KeyGatewayData } | null = null
+
+export function viewKeyData(): Readonly<KeyGatewayData> {
+  const source = peek('keyData')
+  if (keyView?.source !== source) {
+    keyView = { source, data: normalizeKeyData(structuredClone(source) as Partial<KeyGatewayData>) }
+  }
+  return keyView.data
+}
+
+function normalizeKeyData(data: Partial<KeyGatewayData> | undefined): KeyGatewayData {
   // 用默认值打底，兼容旧数据缺字段
   const merged: KeyGatewayData = { ...DEFAULT_KEY_GATEWAY_DATA, ...(data ?? {}) }
   if (!Array.isArray(merged.keys)) merged.keys = []

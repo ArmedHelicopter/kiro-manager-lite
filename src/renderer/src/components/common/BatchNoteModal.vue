@@ -5,7 +5,7 @@
  * 账号列表与 API Key 列表共用这一份。落盘方式两边不同（一个同步写、一个走 IPC），
  * 所以这里只负责收集输入并 emit，具体怎么存、提示什么由调用方决定。
  */
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { message } from 'ant-design-vue'
 
 const props = defineProps<{
@@ -16,11 +16,14 @@ const props = defineProps<{
   placeholder?: string
   /** 调用方正在保存 */
   saving?: boolean
+  /** 预填的备注：只改一个条目（右键「设置备注」）时带上它当前的备注 */
+  initial?: string
 }>()
 
 const emit = defineEmits<{ submit: [note: string]; close: [] }>()
 
-const note = ref('')
+const note = ref(props.initial ?? '')
+const single = computed(() => props.ids.length === 1)
 
 function submit(): void {
   if (!props.ids.length) return void message.info(`没有选中的${props.entity}`)
@@ -31,7 +34,7 @@ function submit(): void {
 <template>
   <a-modal
     :open="true"
-    title="批量设置备注"
+    :title="single ? '设置备注' : '批量设置备注'"
     centered
     width="520px"
     ok-text="保存"
@@ -41,9 +44,12 @@ function submit(): void {
     @cancel="emit('close')"
   >
     <p class="muted tip">
-      将覆盖所选 {{ props.ids.length }} 个{{ props.entity }}的备注；留空则清空这些{{
-        props.entity
-      }}的备注。
+      <template v-if="single">留空则清空该{{ props.entity }}的备注。</template>
+      <template v-else>
+        将覆盖所选 {{ props.ids.length }} 个{{ props.entity }}的备注；留空则清空这些{{
+          props.entity
+        }}的备注。
+      </template>
     </p>
     <a-textarea
       v-model:value="note"

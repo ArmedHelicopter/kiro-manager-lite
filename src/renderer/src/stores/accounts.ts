@@ -1,5 +1,5 @@
 import { acceptHMRUpdate, defineStore } from 'pinia'
-import { computed, ref, shallowRef } from 'vue'
+import { computed, customRef, ref, type Ref } from 'vue'
 import { message } from 'ant-design-vue'
 import {
   DEFAULT_SETTINGS,
@@ -22,7 +22,15 @@ import { errorMessage, isCredentialRejected } from '@shared/errors'
 import { shouldSkipAccountUsageRefresh } from '@shared/refreshPolicy'
 import { DEFAULT_REGION } from '@shared/regions'
 import { runPool } from '@/utils/format'
-import { UNGROUPED } from '@/utils/groups'
+import { countByGroup, matchesGroupFilter } from '@/utils/groups'
+import { runBatchQuery, type BatchQueryResult } from '@/utils/batchQuery'
+import {
+  groupIdsOf,
+  isTrashed,
+  sameGroupIds,
+  validGroupIdsOf,
+  withGroupIds
+} from '@shared/itemGroups'
 import { toPlain } from '@/utils/ipc'
 import { isSocialIdp, normalizeIdp } from '@/utils/transfer'
 import { useSettingsStore } from './settings'
@@ -51,6 +59,11 @@ export interface AccountFilter {
    * 这样「未分组」能和普通分组一样被勾选，不必再加一个布尔开关。
    */
   groupIds: string[]
+  /**
+   * 批量查询的关键字（一行一个，已转小写、去重）；空数组表示没有在批量查询。
+   * 按邮箱 / 昵称 / 备注模糊匹配，命中任意一个即显示。
+   */
+  queries: string[]
 }
 
 // 「未分组」哨兵值定义在 utils/groups，账号与 API Key 两边共用；这里转出去兼容既有引用
@@ -78,6 +91,41 @@ function emptyUsage(): Account['usage'] {
   return { current: 0, limit: 0, percentUsed: 0, lastUpdated: 0 }
 }
 
+/** 账号表变化通知界面的最小间隔（毫秒），见 accounts 的说明 */
+const ACCOUNTS_NOTIFY_MS = 120
+
+/**
+ * 浅层 ref，写入立即生效、通知节流：
+ *  - 读 .value 永远拿到最新写入的值（对所有逻辑代码透明）；
+ *  - 距上次通知超过 wait 时立即通知，否则在这段时间末尾补一次，最后一次修改一定会通知到。
+ */
+function throttledShallowRef<T>(initial: T, wait: number): Ref<T> {
+  return customRef<T>((track, trigger) => {
+    let value = initial
+    let lastNotify = 0
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const notify = (): void => {
+      timer = null
+      lastNotify = Date.now()
+      trigger()
+    }
+    return {
+      get() {
+        track()
+        return value
+      },
+      set(next) {
+        if (Object.is(next, value)) return
+        value = next
+        if (timer) return
+        const elapsed = Date.now() - lastNotify
+        if (elapsed >= wait) notify()
+        else timer = setTimeout(notify, wait - elapsed)
+      }
+    }
+  })
+}
+
 /** 统计里「即将重置」的天数阈值 */
 const EXPIRING_SOON_DAYS = 7
 /** 自动刷新密钥只处理这个时间窗内即将过期的账号 */
@@ -89,15 +137,25 @@ export const useAccountsStore = defineStore('accounts', () => {
   const settingsStore = useSettingsStore()
 
   /*
-   * shallowRef：账号可能有上千个，深层响应式要给每个账号的每层字段都建代理。
+   * 浅层响应式：账号可能有上千个，深层响应式要给每个账号的每层字段都建代理。
    * 这里的所有写法都是整组替换（map / slice 后赋值），从不就地改某个账号的字段，
    * 所以只追踪 .value 就够了。新增写法时也要保持「替换而不是就地修改」。
+   *
+   * 另外把「通知界面」节流成最多每 ACCOUNTS_NOTIFY_MS 一次：
+   * 批量刷新时每个账号回来都要整表换一次，上千个账号就是上千次整表重新筛选、排序、
+   * 重算统计与分组计数，界面会一直卡着。节流后读到的始终是最新数组（这里的代码照常读写），
+   * 只是依赖它的计算属性和界面最多每 120ms 跟进一次。第一次修改立即通知，单次操作没有延迟。
    */
-  const accounts = shallowRef<Account[]>([])
+  const accounts = throttledShallowRef<Account[]>([], ACCOUNTS_NOTIFY_MS)
   /** 分组定义，始终按 order 升序维护，界面直接按数组顺序渲染 */
   const groups = ref<AccountGroup[]>([])
   const activeAccountId = ref<string | null>(null)
   const selectedIds = ref<string[]>([])
+  /**
+   * 是否正在看回收站。打开时列表只显示回收站里的账号（搜索与筛选也只作用于它们），
+   * 关闭时回收站里的账号对列表、搜索、筛选计数完全不可见。
+   */
+  const trashView = ref(false)
   const loading = ref(false)
   const task = ref<TaskState>({
     running: false,
@@ -111,7 +169,8 @@ export const useAccountsStore = defineStore('accounts', () => {
     statuses: [],
     subscriptions: [],
     idps: [],
-    groupIds: []
+    groupIds: [],
+    queries: []
   })
 
   // ============ 持久化 ============
@@ -156,7 +215,18 @@ export const useAccountsStore = defineStore('accounts', () => {
 
   // ============ 查询 ============
 
-  const byId = computed(() => new Map(accounts.value.map((a) => [a.id, a])))
+  /*
+   * id 索引按数组身份缓存，不用计算属性：账号表的通知是节流的（见 accounts 的说明），
+   * 计算属性在通知到达前会一直给旧值，而 get 被各个操作在修改后立刻调用，必须拿到最新的。
+   */
+  let idIndex: { list: Account[]; map: Map<string, Account> } | null = null
+  const byId = {
+    get value(): Map<string, Account> {
+      const list = accounts.value
+      if (idIndex?.list !== list) idIndex = { list, map: new Map(list.map((a) => [a.id, a])) }
+      return idIndex.map
+    }
+  }
 
   function get(id: string): Account | undefined {
     return byId.value.get(id)
@@ -169,16 +239,13 @@ export const useAccountsStore = defineStore('accounts', () => {
   /** id -> 分组，供卡片取名与筛选判断已删除分组 */
   const groupMap = computed(() => new Map(groups.value.map((g) => [g.id, g])))
 
-  /** 各分组下的账号数，外加「未分组」一项，用于面板上的计数 */
-  const groupCounts = computed(() => {
-    const counts: Record<string, number> = { [UNGROUPED]: 0 }
-    for (const g of groups.value) counts[g.id] = 0
-    for (const a of accounts.value) {
-      const key = a.groupId && counts[a.groupId] !== undefined ? a.groupId : UNGROUPED
-      counts[key]++
-    }
-    return counts
-  })
+  /** 各分组下的账号数，外加「未分组」一项，用于面板上的计数（回收站里的不计） */
+  const groupCounts = computed(() => countByGroup(accounts.value, groups.value))
+
+  /** 正常列表里的账号（不含回收站） */
+  const liveAccounts = computed(() => accounts.value.filter((a) => !isTrashed(a)))
+  /** 回收站里的账号数，显示在回收站按钮的角标上 */
+  const trashedCount = computed(() => accounts.value.length - liveAccounts.value.length)
 
   /** 新建分组；同名直接复用已有的那个，避免建出一堆重名分组 */
   function addGroup(name: string): AccountGroup | null {
@@ -214,12 +281,13 @@ export const useAccountsStore = defineStore('accounts', () => {
     groups.value = groups.value
       .filter((g) => g.id !== id)
       .map((g, index) => ({ ...g, order: index }))
+    // 只摘掉被删的这一个分组，账号的其它分组保持不变
     let touched = false
     const next = accounts.value.map((a) => {
-      if (a.groupId !== id) return a
+      const ids = groupIdsOf(a)
+      if (!ids.includes(id)) return a
       touched = true
-      const { groupId: _drop, ...rest } = a
-      return rest as Account
+      return withGroupIds(a, ids.filter((g) => g !== id))
     })
     if (touched) accounts.value = next
     // 该分组若正被用于筛选，一并摘掉，否则列表会突然空掉
@@ -247,23 +315,19 @@ export const useAccountsStore = defineStore('accounts', () => {
   }
 
   /**
-   * 批量设置分组：groupId 传 null 表示移出分组。
+   * 批量设置分组：把所选账号的分组整体替换成 groupIds（可多个），空数组表示移出全部分组。
    * 一次性换数组引用 + 单次 persist，避免逐个写盘。
    */
-  function setGroupForAccounts(ids: string[], groupId: string | null): number {
+  function setGroupForAccounts(ids: string[], groupIds: string[]): number {
     const target = new Set(ids.filter(Boolean))
     if (!target.size) return 0
+    const wanted = groupIds.filter((id) => groupMap.value.has(id))
     let changed = 0
     const next = accounts.value.map((account) => {
       if (!target.has(account.id)) return account
-      if ((account.groupId ?? null) === groupId) return account
+      if (sameGroupIds(validGroupIdsOf(account, (id) => groupMap.value.has(id)), wanted)) return account
       changed++
-      if (groupId === null) {
-        // 未分组用「不存在该字段」表示，置 undefined 会把 undefined 写进存档
-        const { groupId: _drop, ...rest } = account
-        return rest as Account
-      }
-      return { ...account, groupId }
+      return withGroupIds(account, wanted)
     })
     if (changed) {
       accounts.value = next
@@ -272,6 +336,34 @@ export const useAccountsStore = defineStore('accounts', () => {
     }
     return changed
   }
+
+  /*
+   * 搜索用的小写文本按账号对象缓存：账号对象只会整体替换、不会就地修改，
+   * 同一个对象的文本不会变。每次输入或刷新都要对上千个账号拼一遍字符串再转小写，缓存后只算一次。
+   * WeakMap 跟着账号对象一起回收，不会越攒越多。
+   */
+  const searchTexts = new WeakMap<Account, string>()
+  function searchTextOf(a: Account): string {
+    let text = searchTexts.get(a)
+    if (text === undefined) {
+      text = `${a.email} ${a.nickname ?? ''} ${a.note ?? ''}`.toLowerCase()
+      searchTexts.set(a, text)
+    }
+    return text
+  }
+
+  /**
+   * 批量查询结果：与搜索框同一份搜索文本（邮箱 / 昵称 / 备注），模糊匹配。
+   * 只在当前所在的一边（正常列表或回收站）里查，不受其它筛选影响，
+   * 这样「未找到」就是真的不在这里，而不是被筛选挡住了。
+   */
+  const batchQuery = computed<BatchQueryResult | null>(() => {
+    const queries = filter.value.queries
+    if (!queries.length) return null
+    const inTrash = trashView.value
+    const side = accounts.value.filter((a) => isTrashed(a) === inTrash)
+    return runBatchQuery(side, searchTextOf, queries)
+  })
 
   const filtered = computed(() => {
     const {
@@ -289,15 +381,17 @@ export const useAccountsStore = defineStore('accounts', () => {
     } = filter.value
     const keyword = search.trim().toLowerCase()
     const groupSet = groupIds.length ? new Set(groupIds) : null
+    const queryMatched = batchQuery.value?.matched ?? null
+    const inTrash = trashView.value
+    const groupExists = (id: string): boolean => groupMap.value.has(id)
     return accounts.value.filter((a) => {
-      if (keyword) {
-        const haystack = `${a.email} ${a.nickname ?? ''} ${a.note ?? ''}`.toLowerCase()
-        if (!haystack.includes(keyword)) return false
-      }
-      // 分组已被删除的账号一律视为未分组，避免残留 id 让它从列表里消失
-      if (groupSet && !groupSet.has(a.groupId && groupMap.value.has(a.groupId) ? a.groupId : UNGROUPED)) {
-        return false
-      }
+      // 回收站与正常列表互不可见：搜索与筛选都只作用于当前所在的那一边
+      if (isTrashed(a) !== inTrash) return false
+      // 批量查询：命中任意一个关键字（邮箱 / 昵称 / 备注模糊匹配）
+      if (queryMatched && !queryMatched.has(a.id)) return false
+      if (keyword && !searchTextOf(a).includes(keyword)) return false
+      // 多分组：命中所选任一分组即可；分组都已被删除的账号视为未分组
+      if (groupSet && !matchesGroupFilter(a, groupSet, groupExists)) return false
       if (statuses.length && !statuses.includes(a.status)) return false
       if (subscriptions.length && !subscriptions.includes(a.subscription.type)) return false
       if (idps.length && !idps.includes(a.idp)) return false
@@ -335,6 +429,8 @@ export const useAccountsStore = defineStore('accounts', () => {
       subscriptions: [],
       idps: [],
       groupIds: filter.value.groupIds,
+      // 批量查询同样是独立入口（搜索框旁的标签上有 ×），筛选面板重置不清它
+      queries: filter.value.queries,
       daysRemainingMin: undefined,
       daysRemainingMax: undefined,
       usageMin: undefined,
@@ -345,8 +441,13 @@ export const useAccountsStore = defineStore('accounts', () => {
     }
   }
 
-  /** 一次遍历产出各维度计数，界面统计与筛选面板共用 */
+  /**
+   * 一次遍历产出各维度计数，界面统计与筛选面板共用。
+   * 只统计当前所在的一边（正常列表或回收站），筛选面板上的数字才和列表对得上。
+   */
   const stats = computed(() => {
+    const inTrash = trashView.value
+    const scope = accounts.value.filter((a) => isTrashed(a) === inTrash)
     const byStatus: Record<AccountStatus, number> = {
       active: 0,
       expired: 0,
@@ -366,7 +467,7 @@ export const useAccountsStore = defineStore('accounts', () => {
     const byIdp: Record<IdpType, number> = { BuilderId: 0, Github: 0, Google: 0, Enterprise: 0 }
     let expiringSoon = 0
 
-    for (const a of accounts.value) {
+    for (const a of scope) {
       // ?? 0 兜底磁盘上可能存在的旧枚举值，避免出现 NaN
       byStatus[a.status] = (byStatus[a.status] ?? 0) + 1
       bySubscription[a.subscription.type] = (bySubscription[a.subscription.type] ?? 0) + 1
@@ -374,17 +475,30 @@ export const useAccountsStore = defineStore('accounts', () => {
       if ((a.subscription.daysRemaining ?? 99) <= EXPIRING_SOON_DAYS) expiringSoon++
     }
 
-    return { total: accounts.value.length, byStatus, bySubscription, byIdp, expiringSoon }
+    return { total: scope.length, byStatus, bySubscription, byIdp, expiringSoon }
   })
 
   // ============ 增删改 ============
 
+  /*
+   * 查重索引按数组身份缓存：导入几千个账号时每条都要查一次，
+   * 逐条扫整表是「导入数 × 账号数」次比较，几万个账号时会卡住好几秒。
+   * 判定规则不变：userId 相同，或邮箱 + 登录方式相同即视为已存在。
+   */
+  let dupIndex: { list: Account[]; userIds: Set<string>; emailIdp: Set<string> } | null = null
   function exists(email?: string, userId?: string, idp?: IdpType): boolean {
-    return accounts.value.some((a) => {
-      if (userId && a.userId && a.userId === userId) return true
-      if (email && a.email === email && a.idp === idp) return true
-      return false
-    })
+    const list = accounts.value
+    if (dupIndex?.list !== list) {
+      const userIds = new Set<string>()
+      const emailIdp = new Set<string>()
+      for (const a of list) {
+        if (a.userId) userIds.add(a.userId)
+        emailIdp.add(`${a.email}\u0000${a.idp}`)
+      }
+      dupIndex = { list, userIds, emailIdp }
+    }
+    if (userId && dupIndex.userIds.has(userId)) return true
+    return !!email && dupIndex.emailIdp.has(`${email}\u0000${idp}`)
   }
 
   /** 用校验结果拼出完整账号对象 */
@@ -517,6 +631,35 @@ export const useAccountsStore = defineStore('accounts', () => {
     return changed
   }
 
+  /**
+   * 放入 / 移出回收站，返回实际变化的条数。
+   * IDE 正在使用的账号不允许放入：放进去后界面上就找不到它，IDE 却还在用。
+   */
+  function setTrashed(ids: string[], trashed: boolean): { changed: number; error?: string } {
+    const target = new Set(ids.filter(Boolean))
+    if (!target.size) return { changed: 0 }
+    if (trashed && accounts.value.some((a) => target.has(a.id) && a.isActive)) {
+      return { changed: 0, error: 'IDE 当前正在使用的账号不能放入回收站，请先切换到其它账号' }
+    }
+    const now = Date.now()
+    let changed = 0
+    const next = accounts.value.map((account) => {
+      if (!target.has(account.id) || isTrashed(account) === trashed) return account
+      changed++
+      if (trashed) return { ...account, trashedAt: now }
+      const { trashedAt: _drop, ...rest } = account
+      return rest as Account
+    })
+    if (changed) {
+      accounts.value = next
+      // 两边视图互不可见，勾选状态跨视图没有意义
+      selectedIds.value = selectedIds.value.filter((id) => !target.has(id))
+      // 立即落盘：反代按账号选号时直接读主进程的数据
+      persist(true)
+    }
+    return { changed }
+  }
+
   async function removeAccounts(
     ids: string[]
   ): Promise<{ removed: number; error?: string }> {
@@ -527,15 +670,19 @@ export const useAccountsStore = defineStore('accounts', () => {
       clearTimeout(saveTimer)
       saveTimer = null
     }
+    // 删除前记下邮箱写进日志，删完就查不到了；日志里写完整邮箱，不做隐私打码
+    const removingSet = new Set(uniqueIds)
+    const emails = accounts.value.filter((a) => removingSet.has(a.id)).map((a) => a.email)
     const res = await window.api.deleteAccounts(uniqueIds)
     if (!res.success || !res.data) {
       return { removed: 0, error: res.error || '删除账号失败' }
     }
     accounts.value = res.data.accounts.accounts ?? []
     activeAccountId.value = res.data.accounts.activeAccountId ?? null
-    const removedSet = new Set(uniqueIds)
-    selectedIds.value = selectedIds.value.filter((id) => !removedSet.has(id))
-    if (res.data.removed) console.warn(`[Account] 已删除 ${res.data.removed} 个账号`)
+    selectedIds.value = selectedIds.value.filter((id) => !removingSet.has(id))
+    if (res.data.removed) {
+      console.warn(`[Account] 已删除 ${res.data.removed} 个账号（${emails.join('、')}）`)
+    }
     return { removed: res.data.removed }
   }
 
@@ -716,13 +863,14 @@ export const useAccountsStore = defineStore('accounts', () => {
        * 分组 id 先走映射；映射不到时若本机正好有这个分组（同机恢复、或老备份
        * 没带 groups 字段）就沿用，否则当未分组处理，不留悬空引用。
        */
-      const mappedGroupId = raw.groupId
-        ? groupIdMap.get(raw.groupId) ?? (groupMap.value.has(raw.groupId) ? raw.groupId : undefined)
-        : undefined
-      const { groupId: _dropGroupId, ...restRaw } = raw
+      // 老备份只有单个 groupId、新备份是 groupIds，groupIdsOf 两种都认
+      const mappedGroupIds = groupIdsOf(raw)
+        .map((id) => groupIdMap.get(id) ?? (groupMap.value.has(id) ? id : undefined))
+        .filter((id): id is string => !!id)
+      // 导入的账号一律进正常列表，不保留备份里的回收站标记
+      const { trashedAt: _dropTrash, ...restRaw } = withGroupIds(raw, mappedGroupIds)
       created.push({
         ...restRaw,
-        ...(mappedGroupId ? { groupId: mappedGroupId } : {}),
         id: raw.id || crypto.randomUUID(),
         idp,
         isActive: false,
@@ -1094,9 +1242,11 @@ export const useAccountsStore = defineStore('accounts', () => {
    * 临时故障（网络、限流、5xx）不在跳过范围内，下一轮照常重试。
    */
   async function refreshAllUsage(): Promise<void> {
-    const runnable = accounts.value.filter((a) => !shouldSkipAccountUsageRefresh(a))
+    // 回收站里的账号是冷藏的，不参与自动刷新用量
+    const live = liveAccounts.value
+    const runnable = live.filter((a) => !shouldSkipAccountUsageRefresh(a))
     const ids = runnable.map((a) => a.id)
-    const skipped = accounts.value.length - ids.length
+    const skipped = live.length - ids.length
     if (!ids.length) return
     const startedAt = Date.now()
     console.info(
@@ -1253,6 +1403,9 @@ export const useAccountsStore = defineStore('accounts', () => {
   return {
     // 状态
     accounts,
+    liveAccounts,
+    trashedCount,
+    trashView,
     activeAccount,
     selectedIds,
     loading,
@@ -1260,6 +1413,7 @@ export const useAccountsStore = defineStore('accounts', () => {
     filter,
     // 查询
     filtered,
+    batchQuery,
     stats,
     get,
     applyFilter,
@@ -1278,6 +1432,7 @@ export const useAccountsStore = defineStore('accounts', () => {
     removeGroup,
     reorderGroups,
     setGroupForAccounts,
+    setTrashed,
     removeAccounts,
     importItems,
     importFullData,

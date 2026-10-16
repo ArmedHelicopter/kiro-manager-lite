@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
 import { message } from 'ant-design-vue'
 import {
   ClearOutlined,
@@ -48,7 +48,8 @@ const range = ref(0)
 const limit = ref(1000)
 const autoFollow = ref(true)
 
-const entries = ref<LogEntry[]>([])
+// 每次查询整体替换、从不就地修改；上千条日志不必逐条建响应式代理
+const entries = shallowRef<LogEntry[]>([])
 const matched = ref(0)
 const total = ref(0)
 const counts = ref<Record<LogLevel, number>>({ debug: 0, info: 0, warn: 0, error: 0 })

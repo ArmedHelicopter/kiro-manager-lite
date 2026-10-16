@@ -65,19 +65,42 @@ const columns = computed(() => {
 
 const totalRows = computed(() => Math.ceil(props.items.length / columns.value))
 
-/** 每行额外需要的高度：取该行各单元格的最大值，没传 itemExtra 时恒为 0 */
+/**
+ * 量出来的额外高度，按单元格 key 记录。
+ *
+ * 有些加高没法由调用方事先算出：多个分组标签一行放不下折到第二行，
+ * 折不折行取决于标签文字宽度与当前列宽。这类区块在插槽里标上 data-vg-grow，
+ * 这里量「区块实际高度 − 它第一个子元素的高度」，即多出来的那几行。
+ * 区块本身不会被同行更高的兄弟拉伸（拉伸的是卡片，富余高度落在卡片底部动作区上方），
+ * 所以量到的是它自己的内容高度，与 itemExtra 一样只让所在行加高。
+ *
+ * 普通 Map + 版本号：只在数值真变了时让依赖它的行高重算。
+ */
+const grown = new Map<string | number, number>()
+const grownVersion = ref(0)
+
+function keyAt(item: T, index: number): string | number {
+  return props.itemKey ? props.itemKey(item, index) : index
+}
+
+/** 每行额外需要的高度：取该行各单元格（itemExtra + 量到的加高）的最大值 */
 const rowExtras = computed<number[]>(() => {
+  void grownVersion.value
   const rows = totalRows.value
   const list = new Array<number>(rows).fill(0)
   const extraOf = props.itemExtra
-  if (!extraOf) return list
+  if (!extraOf && grown.size === 0) return list
 
   const cols = columns.value
   const count = props.items.length
   for (let row = 0; row < rows; row++) {
     let max = 0
     const end = Math.min(count, (row + 1) * cols)
-    for (let i = row * cols; i < end; i++) max = Math.max(max, extraOf(props.items[i]) || 0)
+    for (let i = row * cols; i < end; i++) {
+      const item = props.items[i]
+      const extra = (extraOf ? extraOf(item) || 0 : 0) + (grown.size ? grown.get(keyAt(item, i)) ?? 0 : 0)
+      if (extra > max) max = extra
+    }
     list[row] = max
   }
   return list
@@ -144,8 +167,7 @@ const gridStyle = computed(() => ({
 }))
 
 function keyOf(item: T, offset: number): string | number {
-  const index = startIndex.value + offset
-  return props.itemKey ? props.itemKey(item, index) : index
+  return keyAt(item, startIndex.value + offset)
 }
 
 /** 可见单元格所在的行号：可见区正好从 startRow 整行开始 */
@@ -195,12 +217,51 @@ defineExpose({ scrollToTop })
  * 所以要先把所在行的额外高度减掉，否则加高行会把基础高度一路顶上去，
  * 最后所有行都变高 —— 那正是这套 itemExtra 想避免的事。
  */
+/**
+ * 量可见单元格里 data-vg-grow 区块的加高，更新到 grown。
+ *
+ * 视口上方的行变高 / 变矮会把正在看的内容整体推开，
+ * 这里按首个可见行的偏移变化同步修正 scrollTop，画面保持不动。
+ */
+function measureGrow(children: HTMLElement[]): void {
+  const items = visibleItems.value
+  let changed = false
+  for (let i = 0; i < children.length && i < items.length; i++) {
+    let extra = 0
+    for (const block of children[i].querySelectorAll<HTMLElement>('[data-vg-grow]')) {
+      const first = block.firstElementChild as HTMLElement | null
+      if (first) extra += Math.max(0, block.offsetHeight - first.offsetHeight)
+    }
+    // 1px 以内的差是取整误差，不算折行
+    if (extra <= 1) extra = 0
+    const key = keyOf(items[i], i)
+    if ((grown.get(key) ?? 0) === extra) continue
+    if (extra) grown.set(key, extra)
+    else grown.delete(key)
+    changed = true
+  }
+  if (!changed) return
+
+  const anchor = firstVisibleRow.value
+  const before = rowOffsets.value[anchor] ?? 0
+  grownVersion.value++
+  const delta = (rowOffsets.value[anchor] ?? 0) - before
+  const el = viewport.value
+  if (delta && el && el.scrollTop > 0) {
+    el.scrollTop += delta
+    scrollTop.value = el.scrollTop
+  }
+}
+
 function measure(): void {
   const el = grid.value
   if (!el || el.children.length === 0) return
 
-  let max = 0
   const children = Array.from(el.children) as HTMLElement[]
+  // 先记下折行带来的加高，下面量基础高度时才能把它从单元格高度里减掉
+  measureGrow(children)
+
+  let max = 0
   for (let i = 0; i < children.length; i++) {
     const extra = rowExtras.value[rowOfOffset(i)] ?? 0
     max = Math.max(max, children[i].scrollHeight - extra)
@@ -266,6 +327,12 @@ onBeforeUnmount(() => {
 watch(columns, () => void nextTick(measure))
 
 /*
+ * 可见内容变了（滚动到新的卡片、数据更新导致分组增减）就量一次折行。
+ * 单元格带着 min-height，折行变化不一定改变网格尺寸，靠 ResizeObserver 捕捉不全。
+ */
+watch(visibleItems, scheduleMeasure)
+
+/*
  * 视口宽度变化后重量一次，并且允许「变矮」。
  *
  * 单元格高度可能是随宽度变的：列表形态的卡片窄屏折行、宽屏收回一行。
@@ -281,6 +348,9 @@ watch(viewportWidth, () => {
   if (remeasureTimer) clearTimeout(remeasureTimer)
   remeasureTimer = setTimeout(() => {
     measured.value = false
+    // 宽度变了，标签折不折行要按新宽度重来；没在视口里的等滚到时再量
+    grown.clear()
+    grownVersion.value++
     void nextTick(measure)
   }, 150)
 })
