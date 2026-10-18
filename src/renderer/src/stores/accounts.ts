@@ -24,6 +24,7 @@ import { DEFAULT_REGION } from '@shared/regions'
 import { runPool } from '@/utils/format'
 import { countByGroup, matchesGroupFilter } from '@/utils/groups'
 import { runBatchQuery, type BatchQueryResult } from '@/utils/batchQuery'
+import { createScopedSearchText } from '@/utils/searchText'
 import {
   groupIdsOf,
   isTrashed,
@@ -34,6 +35,9 @@ import {
 import { toPlain } from '@/utils/ipc'
 import { isSocialIdp, normalizeIdp } from '@/utils/transfer'
 import { useSettingsStore } from './settings'
+
+/** 搜索框左侧的范围选择 */
+export type AccountSearchScope = 'all' | 'email' | 'nickname' | 'note'
 
 export interface AccountFilter {
   search: string
@@ -59,6 +63,8 @@ export interface AccountFilter {
    * 这样「未分组」能和普通分组一样被勾选，不必再加一个布尔开关。
    */
   groupIds: string[]
+  /** 搜索范围：all 为智能搜索（邮箱 + 昵称 + 备注一起找），其余只搜对应字段 */
+  searchScope: AccountSearchScope
   /**
    * 批量查询的关键字（一行一个，已转小写、去重）；空数组表示没有在批量查询。
    * 按邮箱 / 昵称 / 备注模糊匹配，命中任意一个即显示。
@@ -170,6 +176,7 @@ export const useAccountsStore = defineStore('accounts', () => {
     subscriptions: [],
     idps: [],
     groupIds: [],
+    searchScope: 'all',
     queries: []
   })
 
@@ -337,20 +344,13 @@ export const useAccountsStore = defineStore('accounts', () => {
     return changed
   }
 
-  /*
-   * 搜索用的小写文本按账号对象缓存：账号对象只会整体替换、不会就地修改，
-   * 同一个对象的文本不会变。每次输入或刷新都要对上千个账号拼一遍字符串再转小写，缓存后只算一次。
-   * WeakMap 跟着账号对象一起回收，不会越攒越多。
-   */
-  const searchTexts = new WeakMap<Account, string>()
-  function searchTextOf(a: Account): string {
-    let text = searchTexts.get(a)
-    if (text === undefined) {
-      text = `${a.email} ${a.nickname ?? ''} ${a.note ?? ''}`.toLowerCase()
-      searchTexts.set(a, text)
-    }
-    return text
-  }
+  /** 各搜索范围对应的字段，取值与缓存见 createScopedSearchText */
+  const searchTextOf = createScopedSearchText<Account, AccountSearchScope>({
+    all: (a) => `${a.email} ${a.nickname ?? ''} ${a.note ?? ''}`,
+    email: (a) => a.email,
+    nickname: (a) => a.nickname ?? '',
+    note: (a) => a.note ?? ''
+  })
 
   /**
    * 批量查询结果：与搜索框同一份搜索文本（邮箱 / 昵称 / 备注），模糊匹配。
@@ -362,7 +362,8 @@ export const useAccountsStore = defineStore('accounts', () => {
     if (!queries.length) return null
     const inTrash = trashView.value
     const side = accounts.value.filter((a) => isTrashed(a) === inTrash)
-    return runBatchQuery(side, searchTextOf, queries)
+    // 批量查询固定按「邮箱 + 昵称 + 备注」匹配，不跟搜索框的范围选择走
+    return runBatchQuery(side, (a) => searchTextOf(a, 'all'), queries)
   })
 
   const filtered = computed(() => {
@@ -377,7 +378,8 @@ export const useAccountsStore = defineStore('accounts', () => {
       usageMax,
       createdFrom,
       createdTo,
-      groupIds
+      groupIds,
+      searchScope
     } = filter.value
     const keyword = search.trim().toLowerCase()
     const groupSet = groupIds.length ? new Set(groupIds) : null
@@ -389,7 +391,8 @@ export const useAccountsStore = defineStore('accounts', () => {
       if (isTrashed(a) !== inTrash) return false
       // 批量查询：命中任意一个关键字（邮箱 / 昵称 / 备注模糊匹配）
       if (queryMatched && !queryMatched.has(a.id)) return false
-      if (keyword && !searchTextOf(a).includes(keyword)) return false
+      // 搜索：智能搜索走邮箱 + 昵称 + 备注，选了具体字段就只搜那一个
+      if (keyword && !searchTextOf(a, searchScope).includes(keyword)) return false
       // 多分组：命中所选任一分组即可；分组都已被删除的账号视为未分组
       if (groupSet && !matchesGroupFilter(a, groupSet, groupExists)) return false
       if (statuses.length && !statuses.includes(a.status)) return false
@@ -429,6 +432,8 @@ export const useAccountsStore = defineStore('accounts', () => {
       subscriptions: [],
       idps: [],
       groupIds: filter.value.groupIds,
+      // 搜索框清空了，范围跟着回到默认的智能搜索
+      searchScope: 'all',
       // 批量查询同样是独立入口（搜索框旁的标签上有 ×），筛选面板重置不清它
       queries: filter.value.queries,
       daysRemainingMin: undefined,

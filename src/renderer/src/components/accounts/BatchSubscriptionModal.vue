@@ -4,7 +4,8 @@
  *
  * 档位列表用勾选的第一个账号向门户的 GetAvailableSubscriptionPlans 查一次。
  * 已有订阅的账号判为生成失败：门户对它们只回现有订阅的账单页，不是新档位的结算链接。
- * 生成后可逐个打开、复制，或下载 txt（邮箱----链接）。逐个执行与中止见 useBatchRun。
+ * 生成后可逐个打开、复制，或下载 txt（邮箱----链接）/ xlsx（邮箱、订阅链接两列，链接可点击）。
+ * 逐个执行与中止见 useBatchRun。
  */
 import { computed, onMounted, ref } from 'vue'
 import { message } from 'ant-design-vue'
@@ -13,7 +14,9 @@ import {
   CloseCircleFilled,
   CopyOutlined,
   CrownOutlined,
+  DownOutlined,
   DownloadOutlined,
+  FileExcelOutlined,
   GlobalOutlined,
   ReloadOutlined,
   StopOutlined
@@ -69,6 +72,8 @@ const { running, aborted, stat, started, start, abort, stopSilently } = useBatch
 })
 
 const got = computed(() => rows.value.filter((row) => row.state === 'ok' && row.url))
+/** 没有已生成的链接、或正在生成时不给下载 */
+const noDownload = computed(() => !got.value.length || running.value)
 const planTitle = computed(() => plans.value.find((p) => p.subscriptionType === planType.value)?.title ?? '')
 
 function email(account: Account): string {
@@ -126,16 +131,40 @@ async function openUrl(row: Row): Promise<void> {
   if (!res.success) message.error(res.error || '打开链接失败')
 }
 
-async function download(): Promise<void> {
-  if (!got.value.length) return
-  const text = got.value.map((row) => `${row.account.email}----${row.url}`).join('\n')
+/**
+ * 下载已生成的链接。
+ * - txt：一行一个 `邮箱----链接`，可以直接粘到别处
+ * - xlsx：两列「邮箱 / 订阅链接」，链接列是可点击的超链接
+ */
+async function download(kind: 'txt' | 'xlsx'): Promise<void> {
+  const rows = got.value
+  if (!rows.length) return
+
   const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)
-  const res = await window.api.exportToFile(
-    `${text}\n`,
-    `subscription-${planTitle.value.replace(/[^\w+]+/g, '_') || 'plan'}-${got.value.length}个-${stamp}.txt`
-  )
+  const plan = planTitle.value.replace(/[^\w+]+/g, '_') || 'plan'
+  const filename = `subscription-${plan}-${rows.length}个-${stamp}.${kind}`
+
+  const res =
+    kind === 'txt'
+      ? await window.api.exportToFile(
+          `${rows.map((row) => `${row.account.email}----${row.url}`).join('\n')}\n`,
+          filename
+        )
+      : await window.api.exportToXlsx(
+          {
+            name: '订阅链接',
+            columns: [
+              { title: '邮箱', width: 36 },
+              // Stripe 结算链接很长，列宽给大些，打开就能看到一长段
+              { title: '订阅链接', width: 180, format: 'link' }
+            ],
+            rows: rows.map((row) => [row.account.email, row.url ?? null])
+          },
+          filename
+        )
+
   if (!res.success) return void message.error(res.error || '下载失败')
-  if (res.data?.saved) message.success(`已导出 ${got.value.length} 个订阅链接`)
+  if (res.data?.saved) message.success(`已导出 ${rows.length} 个订阅链接`)
 }
 
 function close(): void {
@@ -251,10 +280,26 @@ function close(): void {
     </div>
 
     <div class="footer">
-      <a-button :disabled="!got.length || running" @click="download">
-        <template #icon><DownloadOutlined /></template>
-        下载 txt（{{ got.length }}）
-      </a-button>
+      <!-- 按钮组：主按钮下载 txt，右侧下箭头可改为下载 xlsx（size 见 settings 的 compactSize） -->
+      <a-space-compact :size="settingsStore.compactSize">
+        <a-button :disabled="noDownload" @click="download('txt')">
+          <template #icon><DownloadOutlined /></template>
+          下载 txt（{{ got.length }}）
+        </a-button>
+        <a-dropdown :disabled="noDownload" placement="topRight">
+          <a-button :disabled="noDownload" aria-label="选择下载格式">
+            <template #icon><DownOutlined /></template>
+          </a-button>
+          <template #overlay>
+            <a-menu @click="download('xlsx')">
+              <a-menu-item key="xlsx">
+                <FileExcelOutlined />
+                下载 xlsx（{{ got.length }}）
+              </a-menu-item>
+            </a-menu>
+          </template>
+        </a-dropdown>
+      </a-space-compact>
       <span class="spacer" />
       <a-button @click="close">关闭</a-button>
       <a-button v-if="running" danger :loading="aborted" @click="abort">

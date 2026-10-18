@@ -48,6 +48,17 @@ export function formatCredits(value: number | undefined, precision = false): str
 }
 
 /**
+ * 带千分位的积分数值，用于首页那种单独成块的大数字。
+ * 卡片里的「已用 / 总额」不用这个：那里空间窄，加了分隔符更容易被截断。
+ */
+export function formatCreditsGrouped(value: number | undefined, precision = false): string {
+  if (value == null || Number.isNaN(value)) return '-'
+  return precision
+    ? value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+    : Math.round(value).toLocaleString()
+}
+
+/**
  * 模型消耗倍率，来自上游 Model.rateMultiplier。
  * 整数去掉多余小数（1 → 1x），小数保留两位以内（0.33 → 0.33x）。
  * auto 之类不返回倍率的模型返回空串，由调用方决定是否显示。

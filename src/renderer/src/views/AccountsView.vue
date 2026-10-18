@@ -18,7 +18,6 @@ import {
   PlusOutlined,
   RestOutlined,
   RollbackOutlined,
-  SearchOutlined,
   SyncOutlined,
   UploadOutlined
 } from '@ant-design/icons-vue'
@@ -27,6 +26,9 @@ import CardContextMenu, { type ContextMenuItem } from '@/components/common/CardC
 import TrashToggle from '@/components/common/TrashToggle.vue'
 import BatchQueryModal from '@/components/common/BatchQueryModal.vue'
 import BatchQueryTag from '@/components/common/BatchQueryTag.vue'
+import SearchScopeInput, {
+  type SearchScopeOption
+} from '@/components/common/SearchScopeInput.vue'
 import { useRecentUsage } from '@/composables/useRecentUsage'
 import { useCardContextMenu } from '@/composables/useCardContextMenu'
 import AccountFilterPanel from '@/components/accounts/AccountFilterPanel.vue'
@@ -55,6 +57,7 @@ import SwitchResultModal from '@/components/accounts/SwitchResultModal.vue'
 import { useAccountsStore } from '@/stores/accounts'
 import { useSettingsStore } from '@/stores/settings'
 import { displayEmail as maskedEmail } from '@/utils/display'
+import { NO_BATCH_QUERY_HITS } from '@/utils/batchQuery'
 import { accountGroupApi } from '@/utils/groupApi'
 import { toPlain } from '@/utils/ipc'
 import { buildExportContent } from '@/utils/transfer'
@@ -205,13 +208,19 @@ function toggleGroupFilter(id: string): void {
     : [...list, id]
 }
 
+/** 搜索范围：默认智能搜索（邮箱 + 昵称 + 备注），也可以只搜某一个字段 */
+const SEARCH_SCOPES: SearchScopeOption[] = [
+  { value: 'all', label: '智能搜索', placeholder: '搜索邮箱 / 昵称 / 备注' },
+  { value: 'email', label: '邮箱', placeholder: '只搜邮箱' },
+  { value: 'nickname', label: '昵称', placeholder: '只搜昵称' },
+  { value: 'note', label: '备注', placeholder: '只搜备注' }
+]
+
 // ============ 批量查询 ============
 const batchQueryOpen = ref(false)
 
 /** 命中 / 未找到的统计，口径见 store 的 batchQuery（只看当前所在的一边，不受其它筛选影响） */
-const batchQueryHits = computed(
-  () => accountsStore.batchQuery ?? { hits: 0, missing: [] as string[] }
-)
+const batchQueryHits = computed(() => accountsStore.batchQuery ?? NO_BATCH_QUERY_HITS)
 
 function applyBatchQuery(values: string[]): void {
   accountsStore.filter.queries = values
@@ -726,14 +735,11 @@ function logoutIde(account: Account): void {
             <template #icon><FileSearchOutlined /></template>
           </a-button>
         </a-tooltip>
-        <a-input
+        <SearchScopeInput
           v-model:value="accountsStore.filter.search"
-          allow-clear
-          placeholder="搜索邮箱 / 昵称 / 备注"
-          class="search-input"
-        >
-          <template #prefix><SearchOutlined /></template>
-        </a-input>
+          v-model:scope="accountsStore.filter.searchScope"
+          :options="SEARCH_SCOPES"
+        />
         <BatchQueryTag
           v-if="accountsStore.filter.queries.length"
           :total="accountsStore.filter.queries.length"
@@ -880,7 +886,9 @@ function logoutIde(account: Account): void {
 
         <!-- 展示形态：卡片 / 紧凑卡片 / 列表，选择会持久化 -->
         <DisplayModeSelect :value="displayMode" :size="toolbarSize" @change="setDisplayMode" />
+        <!-- 回收站为空时不显示；正在看回收站时保留，否则清空后就没有返回入口了 -->
         <TrashToggle
+          v-if="accountsStore.trashedCount || accountsStore.trashView"
           :active="accountsStore.trashView"
           :count="accountsStore.trashedCount"
           :size="toolbarSize"
@@ -1150,12 +1158,6 @@ function logoutIde(account: Account): void {
   padding: 6px 0 2px;
   text-align: center;
   font-size: 13px;
-}
-
-/* 搜索框占据左侧剩余空间，但不至于铺满整行 */
-.search-input {
-  width: 100%;
-  max-width: 480px;
 }
 
 .toolbar {

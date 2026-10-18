@@ -22,7 +22,7 @@ import { useSettingsStore } from '@/stores/settings'
 import {
   IDP_META,
   subscriptionMeta,
-  formatCredits,
+  formatCreditsGrouped,
   formatCreditsPair,
   formatDate,
   relativeTime,
@@ -394,16 +394,16 @@ function previewOf(list: Account[]): string {
       <div class="tile-grid">
         <div class="tile">
           <div class="tile-head muted"><RiseOutlined style="color: #1677ff" /> 总额度</div>
-          <div class="tile-value">{{ usageStats.totalLimit.toLocaleString() }}</div>
+          <div class="tile-value">{{ formatCreditsGrouped(usageStats.totalLimit) }}</div>
         </div>
         <div class="tile">
           <div class="tile-head muted"><LineChartOutlined style="color: #fa8c16" /> 已使用</div>
-          <div class="tile-value">{{ formatCredits(usageStats.totalUsed, precision) }}</div>
+          <div class="tile-value">{{ formatCreditsGrouped(usageStats.totalUsed, precision) }}</div>
         </div>
         <div class="tile">
           <div class="tile-head muted"><ThunderboltOutlined style="color: #52c41a" /> 可用额度</div>
           <div class="tile-value" :style="{ color: noQuotaLeft ? '#ff4d4f' : '#52c41a' }">
-            {{ formatCredits(usageStats.available, precision) }}
+            {{ formatCreditsGrouped(usageStats.available, precision) }}
           </div>
         </div>
         <div class="tile">
@@ -416,8 +416,8 @@ function previewOf(list: Account[]): string {
         <span class="muted">总体使用进度</span>
         <span class="progress-meta">
           <span class="muted">
-            {{ formatCredits(usageStats.totalUsed, precision) }} /
-            {{ usageStats.totalLimit.toLocaleString() }}
+            {{ formatCreditsGrouped(usageStats.totalUsed, precision) }} /
+            {{ formatCreditsGrouped(usageStats.totalLimit) }}
           </span>
           <span
             class="percent-pill"
@@ -442,7 +442,7 @@ function previewOf(list: Account[]): string {
         type="warning"
         show-icon
         style="margin-top: 8px"
-        :message="`${usageStats.overQuotaCount} 个账号的已用积分超过当前额度（合计 ${formatCredits(usageStats.excess, precision)}），多为订阅降档所致，其可用额度按 0 计算`"
+        :message="`${usageStats.overQuotaCount} 个账号的已用积分超过当前额度（合计 ${formatCreditsGrouped(usageStats.excess, precision)}），多为订阅降档所致，其可用额度按 0 计算`"
       />
     </a-card>
 

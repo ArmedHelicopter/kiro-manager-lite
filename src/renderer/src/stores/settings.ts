@@ -40,6 +40,16 @@ export const useSettingsStore = defineStore('settings', () => {
     settings.value.componentSize === 'large' ? 'middle' : 'small'
   )
 
+  /**
+   * a-space-compact 的尺寸。
+   *
+   * 它自带 size 默认 middle，并会覆盖组内控件的尺寸，不显式给的话按钮组在
+   * 「大尺寸」设置下会比旁边的普通按钮矮一截 —— 这里把全局尺寸换算成它认的取值。
+   */
+  const compactSize = computed<'middle' | 'large'>(() =>
+    settings.value.componentSize === 'large' ? 'large' : 'middle'
+  )
+
   /** 主题色同时写入 CSS 变量，供 antd 之外的自定义样式使用 */
   function applyTheme(): void {
     const root = document.documentElement
@@ -69,7 +79,17 @@ export const useSettingsStore = defineStore('settings', () => {
     if (res.success && res.data) settings.value = { ...DEFAULT_SETTINGS, ...res.data }
   }
 
-  return { settings, appInfo, themeConfig, isDark, primaryColor, toolbarSize, load, update }
+  return {
+    settings,
+    appInfo,
+    themeConfig,
+    isDark,
+    primaryColor,
+    toolbarSize,
+    compactSize,
+    load,
+    update
+  }
 })
 
 // setup 风格的 store 默认不参与 HMR，改完 store 后运行中的实例会缺少新增方法

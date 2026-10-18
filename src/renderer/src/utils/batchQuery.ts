@@ -27,6 +27,9 @@ export function parseBatchQuery(text: string): ParsedBatchQuery {
   return { values: all.slice(0, BATCH_QUERY_LIMIT), overflow: Math.max(0, all.length - BATCH_QUERY_LIMIT) }
 }
 
+/** 没在批量查询时给界面的占位结果，省掉每个页面各写一份 */
+export const NO_BATCH_QUERY_HITS: { hits: number; missing: string[] } = { hits: 0, missing: [] }
+
 export interface BatchQueryResult {
   /** 命中任意一个关键字的条目 id */
   matched: ReadonlySet<string>

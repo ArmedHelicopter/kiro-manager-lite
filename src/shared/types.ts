@@ -654,9 +654,10 @@ export interface XlsxColumn {
    * - number 普通数值，配合 decimals 控制小数位
    * - percent 百分比，值传 0-1 的小数
    * - datetime 日期时间，值传毫秒时间戳
+   * - link 超链接，值传 http(s) 地址，单元格显示地址本身、点击可打开
    * - 不填按常规格式（文本原样、数字通用）
    */
-  format?: 'number' | 'percent' | 'datetime'
+  format?: 'number' | 'percent' | 'datetime' | 'link'
   /** number / percent 的小数位数，默认 2 */
   decimals?: number
 }

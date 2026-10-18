@@ -22,7 +22,6 @@ import { refreshAccountToken } from './accountService'
 import { sleep } from './utils'
 import {
   getAccountData,
-  getKeyData,
   getProxyModels,
   setAccountData,
   setProxyModels,

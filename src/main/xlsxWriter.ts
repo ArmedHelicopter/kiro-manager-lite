@@ -144,6 +144,14 @@ function safeSheetName(name: string): string {
 }
 
 const XML_HEAD = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+
+/**
+ * 行高：Excel 默认 15（11pt 字体的一行），这里统一放宽到 1.5 倍，表格不那么挤。
+ * 每一行都显式写上并标成 customHeight：超链接列开了自动换行，不钉死的话 Excel
+ * 会按内容把行撑到十几行高。
+ */
+const ROW_HEIGHT = 22.5
+const ROW_HEIGHT_ATTR = ` ht="${ROW_HEIGHT}" customHeight="1"`
 const EPOCH_1900_OFFSET = 25569 // 1970-01-01 在 Excel 1900 日期系统里的序列号
 const MS_PER_DAY = 86400000
 
@@ -165,6 +173,13 @@ function numberFormatCode(column: XlsxColumn): string | null {
   return null
 }
 
+/*
+ * cellXfs 里的固定位次：0 常规、1 表头、2 超链接，数字格式从 3 开始按需追加。
+ * 把超链接放在定值上，列样式就能一遍扫出来，不必先收齐数字格式再回头算下标。
+ */
+const LINK_STYLE = 2
+const FIRST_FORMAT_STYLE = 3
+
 interface StyleTable {
   /** 每列对应的 cellXfs 下标 */
   columnStyles: number[]
@@ -173,16 +188,18 @@ interface StyleTable {
 
 /**
  * 生成 styles.xml：0 号常规、1 号表头（加粗 + 浅底），
- * 之后按列上出现过的数字格式各建一个（相同格式复用同一个 xf）。
+ * 之后按列上出现过的数字格式各建一个（相同格式复用同一个 xf），
+ * 最后一个是超链接样式（蓝色下划线，与 Excel 内置「超链接」样式同色）。
  */
 function buildStyles(columns: XlsxColumn[]): StyleTable {
   const codes: string[] = []
   const columnStyles = columns.map((column) => {
+    if (column.format === 'link') return LINK_STYLE
     const code = numberFormatCode(column)
     if (!code) return 0
     let index = codes.indexOf(code)
     if (index < 0) index = codes.push(code) - 1
-    return 2 + index // 0 常规、1 表头，数字格式从 2 开始
+    return FIRST_FORMAT_STYLE + index
   })
 
   const numFmts = codes.length
@@ -193,6 +210,14 @@ function buildStyles(columns: XlsxColumn[]): StyleTable {
   const cellXfs = [
     '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>',
     '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1" applyAlignment="1"><alignment vertical="center"/></xf>',
+    /*
+     * 超链接样式带 wrapText：Excel 只在右边相邻单元格是空的时候才让文字溢出去显示，
+     * 一条订阅链接能横跨好几列。开了自动换行就只在本列内排版，再配合把行高钉死
+     * （见 ROW_HEIGHT），超出的部分直接被裁掉 ——
+     * 单元格里仍是完整地址，编辑栏能看到、复制出来也是全的。
+     * 顶对齐：行高裁字时让第一行完整显示，从上往下裁比居中裁两头好读。
+     */
+    '<xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment wrapText="1" vertical="top"/></xf>',
     ...codes.map(
       (_code, i) => `<xf numFmtId="${164 + i}" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>`
     )
@@ -201,9 +226,14 @@ function buildStyles(columns: XlsxColumn[]): StyleTable {
   const xml =
     `${XML_HEAD}<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">` +
     numFmts +
-    '<fonts count="2">' +
-    '<font><sz val="11"/><color theme="1"/><name val="Calibri"/><family val="2"/></font>' +
-    '<font><b/><sz val="11"/><color theme="1"/><name val="Calibri"/><family val="2"/></font>' +
+    /*
+     * 0 号正文、1 号表头（加粗）、2 号超链接（蓝色下划线）。
+     * 颜色写死成 rgb 而不是 theme="1"：包里没有 theme 部件，引用主题色属于悬空引用。
+     */
+    '<fonts count="3">' +
+    '<font><sz val="11"/><color rgb="FF000000"/><name val="Calibri"/><family val="2"/></font>' +
+    '<font><b/><sz val="11"/><color rgb="FF000000"/><name val="Calibri"/><family val="2"/></font>' +
+    '<font><u/><sz val="11"/><color rgb="FF0563C1"/><name val="Calibri"/><family val="2"/></font>' +
     '</fonts>' +
     '<fills count="3">' +
     '<fill><patternFill patternType="none"/></fill>' +
@@ -236,10 +266,54 @@ function cellXml(
   return `<c r="${ref}"${style} t="inlineStr"><is><t xml:space="preserve">${escapeXml(value)}</t></is></c>`
 }
 
-function buildWorksheet(sheet: XlsxSheet, columnStyles: number[]): string {
+/** Excel 的超链接长度上限是 2079 字符，更长的只保留文本，免得整份文件被判定需要修复 */
+const MAX_LINK_LENGTH = 2079
+
+/** 超链接列里可以挂成链接的单元格：只认 http(s) 地址 */
+function isLinkable(value: XlsxCellValue): value is string {
+  return typeof value === 'string' && /^https?:\/\//i.test(value) && value.length <= MAX_LINK_LENGTH
+}
+
+interface SheetLink {
+  ref: string
+  /** 关系里的地址，不含 # 之后的片段 */
+  target: string
+  /** # 之后的片段，放在 hyperlink 的 location 属性上 */
+  location?: string
+}
+
+/**
+ * 收集 link 列里的超链接，顺序即关系 id（rId1、rId2…）。
+ *
+ * 带 # 片段的地址必须拆开：关系的 Target 只放 # 之前的部分，片段走 hyperlink 的
+ * location 属性 —— 这也是 Excel 自己的写法。整条塞进 Target 的话，Excel 打开时
+ * 会判定内容有问题并「修复」，修复的做法就是把这一列的超链接全部丢掉。
+ * Stripe 的结算链接正好带一长串 # 片段，所以这里必须拆。
+ */
+function collectLinks(sheet: XlsxSheet): SheetLink[] {
+  const links: SheetLink[] = []
+  sheet.columns.forEach((column, i) => {
+    if (column.format !== 'link') return
+    const letter = columnLetter(i)
+    sheet.rows.forEach((row, rowIndex) => {
+      const value = row[i]
+      if (!isLinkable(value)) return
+      const hash = value.indexOf('#')
+      links.push({
+        ref: `${letter}${rowIndex + 2}`,
+        target: hash < 0 ? value : value.slice(0, hash),
+        location: hash < 0 ? undefined : value.slice(hash + 1)
+      })
+    })
+  })
+  return links
+}
+
+function buildWorksheet(sheet: XlsxSheet, columnStyles: number[], links: SheetLink[]): string {
   const { columns, rows } = sheet
-  const lastColumn = columnLetter(Math.max(0, columns.length - 1))
-  const dimension = `A1:${lastColumn}${rows.length + 1}`
+  // 列字母只跟列号有关：先算一遍，几千行 × 十几列就不必反复推算
+  const letters = columns.map((_c, i) => columnLetter(i))
+  const dimension = `A1:${letters[letters.length - 1] ?? 'A'}${rows.length + 1}`
 
   const cols = columns.some((c) => c.width)
     ? `<cols>${columns
@@ -250,8 +324,8 @@ function buildWorksheet(sheet: XlsxSheet, columnStyles: number[]): string {
         .join('')}</cols>`
     : ''
 
-  const header = `<row r="1">${columns
-    .map((c, i) => cellXml(`${columnLetter(i)}1`, 1, c.title))
+  const header = `<row r="1"${ROW_HEIGHT_ATTR}>${columns
+    .map((c, i) => cellXml(`${letters[i]}1`, 1, c.title))
     .join('')}</row>`
 
   const body = rows
@@ -259,22 +333,31 @@ function buildWorksheet(sheet: XlsxSheet, columnStyles: number[]): string {
       const r = rowIndex + 2
       const cells = columns
         .map((column, i) =>
-          cellXml(`${columnLetter(i)}${r}`, columnStyles[i], row[i] ?? null, column.format)
+          cellXml(`${letters[i]}${r}`, columnStyles[i], row[i] ?? null, column.format)
         )
         .join('')
-      return `<row r="${r}">${cells}</row>`
+      return `<row r="${r}"${ROW_HEIGHT_ATTR}>${cells}</row>`
     })
     .join('')
 
   return (
-    `${XML_HEAD}<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">` +
+    `${XML_HEAD}<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">` +
     `<dimension ref="${dimension}"/>` +
     // 冻结首行，长表格滚动时表头不跑
     '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>' +
-    '<sheetFormatPr defaultRowHeight="15"/>' +
+    `<sheetFormatPr defaultRowHeight="${ROW_HEIGHT}" customHeight="1"/>` +
     cols +
     `<sheetData>${header}${body}</sheetData>` +
     (rows.length ? `<autoFilter ref="${dimension}"/>` : '') +
+    // 按 OOXML 规定 hyperlinks 必须排在 autoFilter 之后
+    (links.length
+      ? `<hyperlinks>${links
+          .map(
+            (link, i) =>
+              `<hyperlink ref="${link.ref}" r:id="rId${i + 1}"${link.location ? ` location="${escapeXml(link.location)}"` : ''}/>`
+          )
+          .join('')}</hyperlinks>`
+      : '') +
     '</worksheet>'
   )
 }
@@ -291,6 +374,25 @@ export function buildZip(files: { name: string; content: string | Buffer }[]): B
 export function buildXlsx(sheet: XlsxSheet): Buffer {
   const { columnStyles, xml: styles } = buildStyles(sheet.columns)
   const name = safeSheetName(sheet.name)
+  const links = collectLinks(sheet)
+
+  // 超链接的目标地址放在工作表自己的关系文件里（外部链接）
+  const sheetRels = links.length
+    ? [
+        {
+          name: 'xl/worksheets/_rels/sheet1.xml.rels',
+          content:
+            `${XML_HEAD}<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+            links
+              .map(
+                (link, i) =>
+                  `<Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="${escapeXml(link.target)}" TargetMode="External"/>`
+              )
+              .join('') +
+            '</Relationships>'
+        }
+      ]
+    : []
 
   return zip([
     {
@@ -327,6 +429,7 @@ export function buildXlsx(sheet: XlsxSheet): Buffer {
         '</Relationships>'
     },
     { name: 'xl/styles.xml', content: styles },
-    { name: 'xl/worksheets/sheet1.xml', content: buildWorksheet(sheet, columnStyles) }
+    { name: 'xl/worksheets/sheet1.xml', content: buildWorksheet(sheet, columnStyles, links) },
+    ...sheetRels
   ])
 }

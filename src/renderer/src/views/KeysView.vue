@@ -19,7 +19,6 @@ import {
   ReloadOutlined,
   RestOutlined,
   RollbackOutlined,
-  SearchOutlined,
   SettingOutlined,
   FilterOutlined,
   SyncOutlined,
@@ -58,6 +57,9 @@ import CardContextMenu, { type ContextMenuItem } from '@/components/common/CardC
 import TrashToggle from '@/components/common/TrashToggle.vue'
 import BatchQueryModal from '@/components/common/BatchQueryModal.vue'
 import BatchQueryTag from '@/components/common/BatchQueryTag.vue'
+import SearchScopeInput, {
+  type SearchScopeOption
+} from '@/components/common/SearchScopeInput.vue'
 import { useRecentUsage } from '@/composables/useRecentUsage'
 import { useCardContextMenu } from '@/composables/useCardContextMenu'
 import { matchesGroupFilter } from '@/utils/groups'
@@ -69,7 +71,8 @@ import {
   keyUsageRatio as usageRatio
 } from '@/utils/keyEntry'
 import KeyCard from '@/components/keys/KeyCard.vue'
-import { runBatchQuery } from '@/utils/batchQuery'
+import { NO_BATCH_QUERY_HITS, runBatchQuery } from '@/utils/batchQuery'
+import { createScopedSearchText } from '@/utils/searchText'
 import { isTrashed } from '@shared/itemGroups'
 import { keyGroupApi } from '@/utils/groupApi'
 import { DEFAULT_REGION } from '@shared/regions'
@@ -94,6 +97,16 @@ const toolbarSize = computed(() => settingsStore.toolbarSize)
 const { data, status, activeKey, loading } = storeToRefs(store)
 const privacyMode = computed(() => settingsStore.settings.privacyMode)
 const search = ref('')
+
+/** 搜索范围：默认智能搜索（Key + 邮箱 + 备注），也可以只搜某一个字段 */
+type SearchScope = 'all' | 'key' | 'email' | 'note'
+const SEARCH_SCOPES: SearchScopeOption[] = [
+  { value: 'all', label: '智能搜索', placeholder: '搜索 API Key / 邮箱 / 备注' },
+  { value: 'key', label: 'API Key', placeholder: '只搜 API Key' },
+  { value: 'email', label: '邮箱', placeholder: '只搜邮箱' },
+  { value: 'note', label: '备注', placeholder: '只搜备注' }
+]
+const searchScope = ref<SearchScope>('all')
 
 // 旧版 Kiro 不读端点覆盖，开启网关会「写成功但请求照旧」，加载时探测一次并给出提示
 const capability = ref<KiroCapability | null>(null)
@@ -191,27 +204,23 @@ const batchQueryOpen = ref(false)
  */
 const batchQuery = ref<string[]>([])
 
-/** 批量查询用的小写文本按条目对象缓存：Key 条目只会整体替换，同一对象的文本不会变 */
-const queryTexts = new WeakMap<KeyEntry, string>()
-function queryTextOf(entry: KeyEntry): string {
-  let text = queryTexts.get(entry)
-  if (text === undefined) {
-    text = `${entry.key} ${entry.email ?? ''} ${entry.note ?? ''}`.toLowerCase()
-    queryTexts.set(entry, text)
-  }
-  return text
-}
+/** 搜索与批量查询共用的小写文本，各搜索范围对应的字段；取值与缓存见 createScopedSearchText */
+const queryTextOf = createScopedSearchText<KeyEntry, SearchScope>({
+  all: (entry) => `${entry.key} ${entry.email ?? ''} ${entry.note ?? ''}`,
+  key: (entry) => entry.key,
+  email: (entry) => entry.email ?? '',
+  note: (entry) => entry.note ?? ''
+})
 
 /** 批量查询结果：只在当前所在的一边里查，不受其它筛选影响，「未找到」就是真的不在这里 */
 const batchQueryResult = computed(() => {
   if (!batchQuery.value.length) return null
   const side = data.value.keys.filter((entry) => isTrashed(entry) === trashView.value)
-  return runBatchQuery(side, queryTextOf, batchQuery.value)
+  // 批量查询固定按「Key + 邮箱 + 备注」匹配，不跟搜索框的范围选择走
+  return runBatchQuery(side, (entry) => queryTextOf(entry, 'all'), batchQuery.value)
 })
 
-const batchQueryHits = computed(
-  () => batchQueryResult.value ?? { hits: 0, missing: [] as string[] }
-)
+const batchQueryHits = computed(() => batchQueryResult.value ?? NO_BATCH_QUERY_HITS)
 
 function applyBatchQuery(values: string[]): void {
   batchQuery.value = values
@@ -439,18 +448,15 @@ const filteredKeys = computed(() => {
   const inTrash = trashView.value
   const groupExists = (id: string): boolean => store.groupMap.has(id)
   const queryMatched = batchQueryResult.value?.matched ?? null
+  const scope = searchScope.value
   return data.value.keys
     .filter((entry) => {
       // 回收站与正常列表互不可见：搜索与筛选都只作用于当前所在的那一边
       if (isTrashed(entry) !== inTrash) return false
       // 批量查询：命中任意一个关键字（Key / 邮箱 / 备注模糊匹配）
       if (queryMatched && !queryMatched.has(entry.id)) return false
-      if (needle) {
-        const hit =
-          (entry.note || '').toLowerCase().includes(needle) ||
-          entry.key.toLowerCase().includes(needle)
-        if (!hit) return false
-      }
+      // 搜索：智能搜索走 Key + 邮箱 + 备注，选了具体字段就只搜那一个
+      if (needle && !queryTextOf(entry, scope).includes(needle)) return false
       // 多分组：命中所选任一分组即可；分组都已被删除的 Key 视为未分组
       if (groupSet && !matchesGroupFilter(entry, groupSet, groupExists)) return false
       if (subscriptions.length && !subscriptions.includes(keyTier(entry))) return false
@@ -1150,9 +1156,11 @@ onUnmounted(() => store.stopStatsPolling())
             <template #icon><FileSearchOutlined /></template>
           </a-button>
         </a-tooltip>
-        <a-input v-model:value="search" allow-clear placeholder="搜索备注或 API Key" class="search-input">
-          <template #prefix><SearchOutlined /></template>
-        </a-input>
+        <SearchScopeInput
+          v-model:value="search"
+          v-model:scope="searchScope"
+          :options="SEARCH_SCOPES"
+        />
         <BatchQueryTag
           v-if="batchQuery.length"
           :total="batchQuery.length"
@@ -1255,7 +1263,9 @@ onUnmounted(() => store.stopStatsPolling())
 
         <!-- 展示形态：卡片 / 紧凑 / 列表，选择会持久化 -->
         <DisplayModeSelect :value="displayMode" :size="toolbarSize" @change="setDisplayMode" />
+        <!-- 回收站为空时不显示；正在看回收站时保留，否则清空后就没有返回入口了 -->
         <TrashToggle
+          v-if="store.trashedCount || trashView"
           :active="trashView"
           :count="store.trashedCount"
           :size="toolbarSize"
@@ -1403,8 +1413,14 @@ onUnmounted(() => store.stopStatsPolling())
       />
     </a-modal>
 
+    <!-- 备注用多行输入，与账号的编辑弹窗、批量设置备注保持一致：备注常写好几件事 -->
     <a-modal v-if="editOpen" v-model:open="editOpen" title="修改备注" @ok="submitEdit">
-      <a-input v-model:value="editNote" placeholder="留空表示无备注" @press-enter="submitEdit" />
+      <a-textarea
+        v-model:value="editNote"
+        :rows="3"
+        placeholder="留空表示无备注"
+        allow-clear
+      />
     </a-modal>
 
     <ExportApiKeysModal v-if="exportOpen" v-model:open="exportOpen" :selected-ids="selectedIds" />
@@ -1624,7 +1640,6 @@ onUnmounted(() => store.stopStatsPolling())
 .toolbar { margin-bottom: 10px; }
 .meta-bar { min-height: 32px; }
 .count-text { color: var(--kal-muted); font-size: 12px; }
-.search-input { width: 100%; max-width: 480px; }
 .spacer { flex: 1 1 auto; }
 .key-grid { flex: 1 1 auto; min-height: 0; }
 .empty { margin: 70px 0; }
